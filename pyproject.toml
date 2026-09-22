@@ -1,0 +1,43 @@
+[project]
+name = "replay-opus"
+version = "0.1.0"
+description = "Batch simulation of loudspeaker playback and microphone re-recording"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "soundfile>=0.12",
+    "PyYAML>=6.0",
+    "av>=12.0",
+]
+
+[project.optional-dependencies]
+simulate = ["pyroomacoustics>=0.7"]
+plots = ["matplotlib>=3.8"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+replay-opus = "replay_opus.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["replay_opus*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "PL", "S", "BLE"]
+ignore = [
+    "PLR0913",  # signal-processing stages legitimately take many parameters
+    "PLR0917",  # same, for positional ones
+    "PLR2004",  # the magic numbers here are the acoustic constants themselves
+    "S101",     # asserts are how the tests express their contracts
+]
+
+[tool.ruff.lint.per-file-ignores]
+# A linear sequence of checks reads better than an artificially split one.
+"replay_opus/selftest.py" = ["PLR0915"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

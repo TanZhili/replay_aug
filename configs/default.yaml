@@ -1,0 +1,69 @@
+# Default replay conditions.
+#
+# Any numeric field written as [low, high] is sampled once per generated variant,
+# so this file describes a distribution of replay conditions, not a single one.
+# Ranges follow the ASVspoof 2019/2021 physical-access protocols where those define
+# a convention; see README.md for the mapping.
+
+seed: 1234
+sr_internal: 48000      # the chain runs wideband and downsamples only at the end
+variants_per_file: 1    # distinct replay conditions per input file
+
+playback:
+  enabled: true
+  # Device grades mirror the perfect / high / low replay-device quality of
+  # ASVspoof 2019 PA. "low" is a phone earpiece, "perfect" is a studio monitor.
+  quality: [perfect, high, low]
+  quality_weights: [0.15, 0.50, 0.35]
+  drive_db: [-9.0, -2.0]   # peak level fed into the non-linearity; sets distortion
+  n_orders: 5              # first five harmonics carry the bulk of the distortion
+  model_dir: null          # directory of measured .npz models; overrides the grades
+
+room:
+  # measured  - convolve IRs from ir_dir unchanged
+  # reshaped  - convolve IRs from ir_dir retargeted to the sampled T60/DRR
+  # synthetic - build an IR from the sampled T60/DRR (no downloads needed)
+  # simulated - image-source method, needs pyroomacoustics
+  enabled: true
+  mode: synthetic
+  ir_dir: null
+  t60_s: [0.08, 0.90]      # ASVspoof 2019 PA spans 0.05-1.0 s
+  drr_db: [-3.0, 20.0]
+  ir_max_ms: 1500.0
+  room_dim_m: [3.0, 3.0, 2.4]       # lower corner of the sampled room size
+  room_dim_max_m: [8.0, 7.0, 3.2]   # upper corner
+  # Loudspeaker-to-microphone distance, only used by mode: simulated.
+  # ASVspoof 2019 PA spans 0.1-1.5 m; 2021 PA widened it to 0.5-2.0 m.
+  distance_m: [0.2, 2.0]
+
+noise:
+  enabled: true
+  noise_dir: null          # real room "silence" beats synthetic colours; see README
+  snr_db: [12.0, 40.0]
+
+capture:
+  enabled: true
+  mic_ir_dir: null         # e.g. POLIPHONE handset IRs
+  agc: true
+  agc_target_dbfs: [-26.0, -16.0]
+  agc_max_gain_db: 30.0
+  # Where the peak lands relative to full scale. The range crosses zero on purpose:
+  # a minority of real recordings are levelled too hot and clip.
+  adc_headroom_db: [-6.0, 1.0]
+
+transport:
+  enabled: true
+  # null means "no codec". Unavailable codecs are dropped automatically at startup.
+  codecs: [null, opus, aac, mp3]
+  codec_weights: [0.30, 0.40, 0.15, 0.15]
+  bitrate_bps: [16000, 64000]
+  clock_drift_ppm: [-100.0, 100.0]   # consumer crystals drift 50-100 ppm
+
+output:
+  sr: 16000
+  peak_db: [-3.0, -1.0]
+  subtype: PCM_16
+  suffix: .wav
+  # Reverberant tail kept past the end of the input. Without a cap, convolution
+  # adds the whole IR length and stretches every file by up to 1.5 s.
+  tail_ms: 300.0
