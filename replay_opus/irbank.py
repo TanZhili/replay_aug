@@ -25,6 +25,7 @@ from .metrics import (
     estimate_t60,
     split_direct_late,
 )
+from .pathlist import common_root, read_path_list, relative_labels
 
 IR_SUFFIXES = (".wav", ".flac", ".ogg", ".aiff", ".aif")
 
@@ -210,28 +211,30 @@ def simulate_room_ir(
 
 @dataclass
 class IRBank:
-    """A pool of impulse responses on disk, loaded lazily and cached in memory."""
+    """A pool of impulse responses named by a path list, loaded lazily and cached."""
 
     root: Path | None
     sr: int
     max_ms: float = 1500.0
     paths: list[Path] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
     # Bounded so pointing at a large simulated-RIR corpus (SLR28 has tens of
     # thousands) cannot grow the worker's memory without limit.
     cache_size: int = 512
     _cache: dict[Path, np.ndarray] = field(default_factory=dict, repr=False)
 
     @classmethod
-    def from_dir(cls, root: str | Path | None, sr: int, max_ms: float = 1500.0) -> IRBank:
-        if root is None:
+    def from_list(cls, list_path: str | Path | None, sr: int, max_ms: float = 1500.0) -> IRBank:
+        if list_path is None:
             return cls(root=None, sr=sr, max_ms=max_ms)
-        root_path = Path(root)
-        if not root_path.exists():
-            raise FileNotFoundError(f"IR directory not found: {root_path}")
-        paths = sorted(p for p in root_path.rglob("*") if p.suffix.lower() in IR_SUFFIXES)
-        if not paths:
-            raise FileNotFoundError(f"no impulse responses under {root_path}")
-        return cls(root=root_path, sr=sr, max_ms=max_ms, paths=paths)
+        paths = read_path_list(list_path, kind="impulse response", suffixes=IR_SUFFIXES)
+        return cls(
+            root=common_root(paths),
+            sr=sr,
+            max_ms=max_ms,
+            paths=paths,
+            labels=relative_labels(paths),
+        )
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -246,19 +249,27 @@ class IRBank:
     def sample(self, rng: np.random.Generator) -> tuple[np.ndarray, str]:
         if not self.paths:
             raise RuntimeError("IR bank is empty")
-        path = self.paths[int(rng.integers(len(self.paths)))]
-        rel = str(path.relative_to(self.root)) if self.root else str(path)
-        return self.get(path), rel
+        index = int(rng.integers(len(self.paths)))
+        return self.get(self.paths[index]), self._label(index)
+
+    def _label(self, index: int) -> str:
+        if self.labels:
+            return self.labels[index]
+        path = self.paths[index]
+        if self.root is not None:
+            return path.relative_to(self.root).as_posix()
+        return path.name
 
     def stats(self) -> list[dict]:
         rows = []
-        for path in self.paths:
+        for index, path in enumerate(self.paths):
+            label = self._label(index)
             try:
                 h = self.get(path)
             except Exception as exc:  # noqa: BLE001 - report and continue
-                rows.append({"ir": str(path), "error": str(exc)})
+                rows.append({"ir": label, "error": str(exc)})
                 continue
-            row = {"ir": str(path.relative_to(self.root)) if self.root else str(path)}
+            row = {"ir": label}
             row.update(describe_ir(h, self.sr))
             rows.append(row)
         return rows

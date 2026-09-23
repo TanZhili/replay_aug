@@ -233,7 +233,7 @@ def test_config_rejects_unknown_keys():
         Config.from_dict({"room": {"nope": 1}})
 
 
-def test_config_requires_ir_dir_for_measured_mode():
+def test_config_requires_ir_list_for_measured_mode():
     config = Config.from_dict({"room": {"mode": "measured"}})
-    with pytest.raises(ValueError, match=r"requires room\.ir_dir"):
+    with pytest.raises(ValueError, match=r"requires room\.ir_list"):
         config.validate()

@@ -1,0 +1,6 @@
+# Clean clips used by the checked-in demo. One path per line, relative to this file.
+source_batch/tts_000.wav
+source_batch/tts_001.wav
+source_batch/tts_002.wav
+source_batch/tts_003.wav
+source_batch/tts_004.wav

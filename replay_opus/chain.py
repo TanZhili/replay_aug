@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 from scipy import signal
@@ -21,6 +20,7 @@ from .dsp import fade_edges, resample_to, rms_db, sample_range, set_peak_db, to_
 from .irbank import IRBank, reshape_ir, simulate_room_ir, synth_ir
 from .metrics import describe_ir
 from .noise import NoiseBank, mix_at_snr
+from .pathlist import read_path_list
 from .speaker import SpeakerModel, apply_speaker, synth_speaker_kernels
 from .transport import CodecSpec, apply_transport, available_codecs
 
@@ -47,28 +47,26 @@ class ReplayChain:
 
         room = config.room
         self.ir_bank = (
-            IRBank.from_dir(room.ir_dir, self.sr, room.ir_max_ms)
+            IRBank.from_list(room.ir_list, self.sr, room.ir_max_ms)
             if room.mode in {"measured", "reshaped"}
             else None
         )
         self.mic_bank = (
-            IRBank.from_dir(config.capture.mic_ir_dir, self.sr, 200.0)
-            if config.capture.enabled and config.capture.mic_ir_dir
+            IRBank.from_list(config.capture.mic_ir_list, self.sr, 200.0)
+            if config.capture.enabled and config.capture.mic_ir_list
             else None
         )
         self.noise_bank = (
-            NoiseBank.from_dir(config.noise.noise_dir, self.sr) if config.noise.enabled else None
+            NoiseBank.from_list(config.noise.noise_list, self.sr) if config.noise.enabled else None
         )
         self.speaker_models = self._load_speaker_models()
         self.codec_names, self.codec_weights = self._resolve_codecs()
 
     def _load_speaker_models(self) -> list[SpeakerModel]:
-        directory = self.config.playback.model_dir
-        if not directory:
+        list_path = self.config.playback.model_list
+        if not list_path:
             return []
-        paths = sorted(Path(directory).glob("*.npz"))
-        if not paths:
-            raise FileNotFoundError(f"no measured speaker models (*.npz) in {directory}")
+        paths = read_path_list(list_path, kind="speaker model", suffixes=(".npz",))
         return [SpeakerModel.load(p, self.sr) for p in paths]
 
     def _resolve_codecs(self) -> tuple[list[str | None], np.ndarray]:

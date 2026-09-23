@@ -17,16 +17,16 @@ playback:
   quality_weights: [0.15, 0.50, 0.35]
   drive_db: [-9.0, -2.0]   # peak level fed into the non-linearity; sets distortion
   n_orders: 5              # first five harmonics carry the bulk of the distortion
-  model_dir: null          # directory of measured .npz models; overrides the grades
+  model_list: null         # path list of measured .npz models; overrides the grades
 
 room:
-  # measured  - convolve IRs from ir_dir unchanged
-  # reshaped  - convolve IRs from ir_dir retargeted to the sampled T60/DRR
+  # measured  - convolve IRs named in ir_list unchanged
+  # reshaped  - convolve those IRs retargeted to the sampled T60/DRR
   # synthetic - build an IR from the sampled T60/DRR (no downloads needed)
   # simulated - image-source method, needs pyroomacoustics
   enabled: true
   mode: synthetic
-  ir_dir: null
+  ir_list: null            # text file, one IR path per line; not a directory
   t60_s: [0.08, 0.90]      # ASVspoof 2019 PA spans 0.05-1.0 s
   drr_db: [-3.0, 20.0]
   ir_max_ms: 1500.0
@@ -38,12 +38,12 @@ room:
 
 noise:
   enabled: true
-  noise_dir: null          # real room "silence" beats synthetic colours; see README
+  noise_list: null         # text file of real room "silence"; see README
   snr_db: [12.0, 40.0]
 
 capture:
   enabled: true
-  mic_ir_dir: null         # e.g. POLIPHONE handset IRs
+  mic_ir_list: null        # text file of microphone IRs, e.g. POLIPHONE
   agc: true
   agc_target_dbfs: [-26.0, -16.0]
   agc_max_gain_db: 30.0

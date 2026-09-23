@@ -17,15 +17,12 @@ from .config import Config
 from .irbank import IRBank, filter_ir_stats
 from .measure import SweepSpec, measure_chain, sweep_with_padding
 from .metrics import describe_ir
+from .pathlist import read_path_list, relative_labels
 from .selftest import run_selftest
 
 AUDIO_SUFFIXES = (".wav", ".flac", ".ogg", ".mp3", ".m4a", ".opus")
 
 _WORKER: dict[str, object] = {}
-
-
-def find_audio(root: Path) -> list[Path]:
-    return sorted(p for p in root.rglob("*") if p.suffix.lower() in AUDIO_SUFFIXES)
 
 
 def _init_worker(config_dict: dict) -> None:
@@ -42,39 +39,50 @@ def _process_one(args: tuple[str, str, str, int]) -> dict:
     return {"input": in_path, "output": out_path, **result.meta}
 
 
-def cmd_simulate(args: argparse.Namespace) -> int:
-    config = Config.load(args.config)
+def _apply_simulate_overrides(config: Config, args: argparse.Namespace) -> None:
     if args.seed is not None:
         config.seed = args.seed
     if args.variants is not None:
         config.variants_per_file = args.variants
-    if args.room_ir_dir:
-        config.room.ir_dir = args.room_ir_dir
+    if args.room_ir_list:
+        config.room.ir_list = args.room_ir_list
         config.room.mode = args.room_mode or "reshaped"
     elif args.room_mode:
         config.room.mode = args.room_mode
+    if args.noise_list:
+        config.noise.noise_list = args.noise_list
+    if args.mic_ir_list:
+        config.capture.mic_ir_list = args.mic_ir_list
+    if args.speaker_model_list:
+        config.playback.model_list = args.speaker_model_list
 
-    in_root, out_root = Path(args.input), Path(args.output)
-    files = find_audio(in_root)
-    if not files:
-        print(f"no audio found under {in_root}", file=sys.stderr)
+
+def cmd_simulate(args: argparse.Namespace) -> int:
+    config = Config.load(args.config)
+    _apply_simulate_overrides(config, args)
+
+    try:
+        files = read_path_list(args.input, kind="input audio", suffixes=AUDIO_SUFFIXES)
+        probe = ReplayChain(config)
+    except (FileNotFoundError, ValueError) as exc:
+        print(exc, file=sys.stderr)
         return 1
+    labels = relative_labels(files)
+    out_root = Path(args.output)
 
-    probe = ReplayChain(config)
     print(json.dumps(describe_config(probe), ensure_ascii=False))
     print(f"{len(files)} input files x {config.variants_per_file} variants")
 
     jobs = []
-    for path in files:
-        key = str(path.relative_to(in_root)).replace(os.sep, "/")
+    for path, label in zip(files, labels, strict=True):
+        stem = Path(label).with_suffix("").as_posix()
         for variant in range(config.variants_per_file):
-            stem = path.relative_to(in_root).with_suffix("")
             name = (
                 f"{stem}{config.output.suffix}"
                 if config.variants_per_file == 1
-                else (f"{stem}__v{variant}{config.output.suffix}")
+                else f"{stem}__v{variant}{config.output.suffix}"
             )
-            jobs.append((str(path), str(out_root / name), key, variant))
+            jobs.append((str(path), str(out_root / name), label, variant))
 
     out_root.mkdir(parents=True, exist_ok=True)
     manifest_path = out_root / "manifest.jsonl"
@@ -161,7 +169,11 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
 
 def cmd_ir_stats(args: argparse.Namespace) -> int:
-    bank = IRBank.from_dir(args.ir_dir, args.sr)
+    try:
+        bank = IRBank.from_list(args.ir_list, args.sr)
+    except (FileNotFoundError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
     rows = bank.stats()
     kept = filter_ir_stats(rows)
     print(f"{len(rows)} impulse responses, {len(kept)} within usable T60/DRR bounds")
@@ -191,13 +203,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sim = sub.add_parser("simulate", help="run the replay chain over a directory")
-    sim.add_argument("--input", required=True, help="directory of source audio")
+    sim = sub.add_parser("simulate", help="run the replay chain over a path list")
+    sim.add_argument(
+        "--input", required=True, help="text file listing source audio, one path per line"
+    )
     sim.add_argument("--output", required=True, help="directory for generated audio")
     sim.add_argument("--config", help="YAML config; defaults are used when omitted")
     sim.add_argument("--seed", type=int, help="override config seed")
     sim.add_argument("--variants", type=int, help="replay conditions per input file")
-    sim.add_argument("--room-ir-dir", help="directory of room IRs; implies room mode 'reshaped'")
+    sim.add_argument(
+        "--room-ir-list",
+        help="text file listing room IRs; implies room mode 'reshaped'",
+    )
+    sim.add_argument(
+        "--noise-list",
+        help="text file listing noise recordings; overrides noise.noise_list",
+    )
+    sim.add_argument(
+        "--mic-ir-list",
+        help="text file listing microphone IRs; overrides capture.mic_ir_list",
+    )
+    sim.add_argument(
+        "--speaker-model-list",
+        help="text file listing measured speaker models (*.npz)",
+    )
     sim.add_argument("--room-mode", choices=["measured", "reshaped", "synthetic", "simulated"])
     sim.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     sim.set_defaults(func=cmd_simulate)
@@ -220,8 +249,8 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--ir-ms", type=float, default=1500.0)
     extract.set_defaults(func=cmd_extract)
 
-    stats = sub.add_parser("ir-stats", help="report T60 / DRR / C50 over an IR directory")
-    stats.add_argument("--ir-dir", required=True)
+    stats = sub.add_parser("ir-stats", help="report T60 / DRR / C50 for IRs named in a path list")
+    stats.add_argument("--ir-list", required=True, help="text file listing impulse responses")
     stats.add_argument("--sr", type=int, default=48000)
     stats.add_argument("--output", help="write per-IR records as JSONL")
     stats.set_defaults(func=cmd_ir_stats)

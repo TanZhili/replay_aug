@@ -23,18 +23,18 @@ class PlaybackConfig:
     quality_weights: list[float] = field(default_factory=lambda: [0.15, 0.50, 0.35])
     drive_db: Range = field(default_factory=lambda: [-9.0, -2.0])
     n_orders: int = 5
-    model_dir: str | None = None
+    model_list: str | None = None
 
 
 @dataclass
 class RoomConfig:
     enabled: bool = True
-    # measured: convolve IRs from ir_dir as-is
-    # reshaped: convolve IRs from ir_dir retargeted to the sampled T60/DRR
+    # measured: convolve IRs named in ir_list as-is
+    # reshaped: convolve those IRs retargeted to the sampled T60/DRR
     # synthetic: build an IR from the sampled T60/DRR
     # simulated: image-source method via pyroomacoustics
     mode: str = "synthetic"
-    ir_dir: str | None = None
+    ir_list: str | None = None
     t60_s: Range = field(default_factory=lambda: [0.08, 0.9])
     drr_db: Range = field(default_factory=lambda: [-3.0, 20.0])
     ir_max_ms: float = 1500.0
@@ -48,14 +48,14 @@ class RoomConfig:
 @dataclass
 class NoiseConfig:
     enabled: bool = True
-    noise_dir: str | None = None
+    noise_list: str | None = None
     snr_db: Range = field(default_factory=lambda: [12.0, 40.0])
 
 
 @dataclass
 class CaptureConfig:
     enabled: bool = True
-    mic_ir_dir: str | None = None
+    mic_ir_list: str | None = None
     agc: bool = True
     agc_target_dbfs: Range = field(default_factory=lambda: [-26.0, -16.0])
     agc_max_gain_db: float = 30.0
@@ -111,8 +111,8 @@ class Config:
     def validate(self) -> None:
         if self.room.mode not in {"measured", "reshaped", "synthetic", "simulated"}:
             raise ValueError(f"unknown room.mode {self.room.mode!r}")
-        if self.room.mode in {"measured", "reshaped"} and not self.room.ir_dir:
-            raise ValueError(f"room.mode={self.room.mode!r} requires room.ir_dir")
+        if self.room.mode in {"measured", "reshaped"} and not self.room.ir_list:
+            raise ValueError(f"room.mode={self.room.mode!r} requires room.ir_list")
         if len(self.playback.quality) != len(self.playback.quality_weights):
             raise ValueError("playback.quality and playback.quality_weights differ in length")
         if len(self.transport.codecs) != len(self.transport.codec_weights):

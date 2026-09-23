@@ -1,6 +1,6 @@
 """Additive noise stage: room noise floor and microphone self-noise.
 
-Real recordings are never silent between words. Prefer a directory of real "silence"
+Real recordings are never silent between words. Prefer a path list of real "silence"
 recordings (BUT ReverbDB ships them alongside its RIRs, MUSAN and DEMAND also work);
 the synthetic colours here are a fallback so the pipeline runs with no downloads.
 """
@@ -15,6 +15,7 @@ import soundfile as sf
 from scipy import signal
 
 from .dsp import EPS, resample_to, rms, to_mono
+from .pathlist import common_root, read_path_list, relative_labels
 
 NOISE_SUFFIXES = (".wav", ".flac", ".ogg")
 SYNTHETIC_COLOURS = ("white", "pink", "brown", "hvac")
@@ -46,26 +47,27 @@ def synth_noise(colour: str, n: int, sr: int, rng: np.random.Generator) -> np.nd
 
 @dataclass
 class NoiseBank:
-    """Real noise recordings if available, synthetic colours otherwise."""
+    """Real noise recordings if a path list is given, synthetic colours otherwise."""
 
     root: Path | None
     sr: int
     paths: list[Path] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
     colours: tuple[str, ...] = SYNTHETIC_COLOURS
     cache_size: int = 64
     _cache: dict[Path, np.ndarray] = field(default_factory=dict, repr=False)
 
     @classmethod
-    def from_dir(cls, root: str | Path | None, sr: int) -> NoiseBank:
-        if root is None:
+    def from_list(cls, list_path: str | Path | None, sr: int) -> NoiseBank:
+        if list_path is None:
             return cls(root=None, sr=sr)
-        root_path = Path(root)
-        if not root_path.exists():
-            raise FileNotFoundError(f"noise directory not found: {root_path}")
-        paths = sorted(p for p in root_path.rglob("*") if p.suffix.lower() in NOISE_SUFFIXES)
-        if not paths:
-            raise FileNotFoundError(f"no noise files under {root_path}")
-        return cls(root=root_path, sr=sr, paths=paths)
+        paths = read_path_list(list_path, kind="noise", suffixes=NOISE_SUFFIXES)
+        return cls(
+            root=common_root(paths),
+            sr=sr,
+            paths=paths,
+            labels=relative_labels(paths),
+        )
 
     def _load(self, path: Path) -> np.ndarray:
         if path not in self._cache:
@@ -80,14 +82,15 @@ class NoiseBank:
             colour = self.colours[int(rng.integers(len(self.colours)))]
             return synth_noise(colour, n, self.sr, rng), f"synthetic:{colour}"
 
-        path = self.paths[int(rng.integers(len(self.paths)))]
+        index = int(rng.integers(len(self.paths)))
+        path = self.paths[index]
         noise = self._load(path)
         if len(noise) < n:
             reps = int(np.ceil(n / max(len(noise), 1)))
             noise = np.tile(noise, reps)
         start = int(rng.integers(0, max(1, len(noise) - n + 1)))
         segment = noise[start : start + n]
-        label = str(path.relative_to(self.root)) if self.root else str(path)
+        label = self.labels[index] if self.labels else path.name
         return segment / (np.std(segment) + EPS), label
 
 
