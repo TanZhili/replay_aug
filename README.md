@@ -144,6 +144,57 @@ labels = frame_labels(record["segments"], record["duration_s"], frame_s=0.02)
 # 0 = 无语音，1 = 仅真人，2 = 仅外放，3 = 重叠
 ```
 
+## 用法三：`mix`，麦克风里的整段环境声
+
+`render` 把一句话分别做成真人版和外放版。`mix` 要的是麦克风实际听到的那一条：用户和外放可以同时在，噪声和房间也在。四个输入都是文件，也都可以不给。
+
+| 输入 | 是什么 | 不给的时候 |
+| --- | --- | --- |
+| 用户语音 A（`speech`） | 真人。走嘴、说话电平和指向 | 这段里没有用户 |
+| 外放素材 B（`playback`） | 渲染成电子设备外放：节目链、扬声器，再进房间 | 这段里没有外放 |
+| 噪声音频（`noise`） | 麦克风处的环境噪声录音 | 用这个场景的合成噪声 |
+| 实录房间 RIR（`rir`） | 这一间房的脉冲响应，用户和各个扬声器单元共用 | 用鞋盒房间模型 |
+
+A 和 B 可以来自同一批 TTS，也可以是同一个文件。两条都从时刻 0 开始，在麦克风处叠在一起；较长的那条单独延续到结束。噪声文件会缩放到该场景抽到的 A 计权声压级。实测 RIR 的绝对增益不用，直达声按声源到麦克风的距离重定标。输出再经过和 `render` 相同的采集链。
+
+```python
+from replay_opus import render_mic
+
+mic = render_mic(
+    speech="tts/user.wav",          # A，可省略
+    playback="tts/programme.wav",   # B，可省略，可以和 A 同一批 TTS
+    noise="noise/hvac.wav",         # 可省略
+    rir="irs/living/sofa.wav",      # 可省略
+)
+# mic.audio 是麦克风信号，mic.meta["segments"] 里 role 为 live 或 device
+```
+
+批量渲染用四个列表，每一个都可以不给。写法和「一行一条语音」相同；A、B 的列表还可以带文本和说话人。按行对齐：第 i 条混音取每份列表的第 i 行，较短的列表从头循环。条数默认是最长那份列表的行数，`--count` 可以改。四份列表都空着时，必须给 `--count`，出来的是只有合成噪声和鞋盒房间的空场景。同一份列表可以同时当作 A 和 B。
+
+```python
+from replay_opus.mix import main
+
+main(
+    speech_list="user.txt",
+    playback_list="device.txt",
+    noise_list="noise.txt",
+    rir_list="rirs.txt",
+    output="out/mix",
+)
+```
+
+```bash
+python -m replay_opus mix --speech-list user.txt --playback-list device.txt --noise-list noise.txt --rir-list rirs.txt --output out/mix
+```
+
+```text
+out/mix/mix_000000.wav
+out/mix/manifest.jsonl          每个混音一行，segments 的时间是到达麦克风的时刻
+out/mix/config.yaml
+```
+
+`segments` 转成帧级标签的方式和 `scenes` 相同，`frame_labels` 直接吃这份清单里的 `segments`。
+
 ## 防捷径设计
 
 拒识模型会学训练集里最便宜的区分特征。这里刻意让下面这些**不能**用来区分两类：
@@ -188,6 +239,56 @@ python -m replay_opus judge --manifest out/pairs/manifest.jsonl
 ```
 
 权重在第一次运行时下载到 `~/.cache/replay_opus/detectors`，可以用环境变量 `REPLAY_OPUS_CACHE` 改位置。
+
+### 输入格式
+
+`judge` 读 `render` 写出的 `manifest.jsonl`。要带阳性对照时，还要读当时那份 `config.yaml`。`--reference` 是可选的第三份：你自己录的、已经标好类别的录音。
+
+#### `manifest.jsonl`
+
+`--manifest` 指向的文件一行一个 JSON 对象。`judge` 只保留 `label` 为 `live` 或 `device` 的行，再按 `pair` 配成一对。一对在清单里是两行，共用同一个 `pair`。
+
+`render` 写出的每一行都带这些字段，缺了就配不上对，或者建不出阳性对照：
+
+| 字段 | 含义 |
+| --- | --- |
+| `pair` | 成对 ID，形如 `zh_000.wav#0`。真人版和外放版相同 |
+| `label` | `live` 或 `device` |
+| `audio` | 渲染结果的路径，相对 manifest 所在目录 |
+| `input` | 渲染前的原始语音。算 `dry` 和重放阳性对照时会重新打开它，这个路径得还在 |
+| `key` | 这条语音在输入列表里的名字 |
+| `variant` | 第几个场景。和 `key`、渲染时的配置一起决定房间 |
+| `scene` | 场景。`scene.room` 用来核对重建出来的是不是同一个房间，`scene.environment` 用来按环境汇总 |
+| `source` | 声源。外放行的 `source.device` 用来按设备汇总 |
+
+`text`、`speaker`、`at_mic` 留在文件里，打分不用。下面是一对里的两行，`scene` 和 `source` 只留了 `judge` 会读的字段：
+
+```text
+{"audio": "live/zh_000__v0.wav", "input": "D:/data/tts/zh_000.wav", "pair": "zh_000.wav#0", "label": "live", "key": "zh_000.wav", "variant": 0, "scene": {"environment": "living_room", "room": {…}}, "source": {"role": "live", …}}
+{"audio": "device/zh_000__v0.wav", "input": "D:/data/tts/zh_000.wav", "pair": "zh_000.wav#0", "label": "device", "key": "zh_000.wav", "variant": 0, "scene": {"environment": "living_room", "room": {…}}, "source": {"role": "device", "device": "tv", …}}
+```
+
+`scenes` 和 `mix` 的清单是一条流加时间标签，没有 `pair` / `label` 这一对字段，不能交给 `judge`。
+
+阳性对照会按 `key`、`variant` 和 `config.yaml` 把场景重建一遍，再用 `scene.room` 核对。`config.yaml` 默认读 manifest 旁边那份，也就是 `render` 存下来的；不在旁边就用 `--config` 指过去。`--no-controls` 只给清单里已经写好的音频打分，不再重建场景，这时可以不提供配置。
+
+#### 真实录音：`--reference`
+
+写法和语音列表相同。一行一条，相对路径相对这份列表所在的目录，空行和以 `#` 开头的行跳过，编码接受 UTF-8、带 BOM 的 UTF-8 和 UTF-16。第二列是类别，不是转写文本：
+
+```text
+rec/user_01.wav	bonafide
+rec/tv_01.wav	spoof
+```
+
+`.jsonl` 也可以，类别写在 `text` 里：
+
+```json
+{"audio": "rec/user_01.wav", "text": "bonafide"}
+{"audio": "rec/tv_01.wav", "text": "spoof"}
+```
+
+认作重放的写法：`spoof`、`replay`、`device`、`fake`、`1`。认作真人的写法：`bonafide`、`bona_fide`、`genuine`、`live`、`real`、`0`。大小写不敏感。两列都要有，空标签会报错。
 
 ### 调研结论：重放检测没有真正意义上的开源 SOTA
 
@@ -305,8 +406,8 @@ python -m replay_opus extract --recording rec.wav --output responses/ --name liv
 ## 验证
 
 - `python -m replay_opus selftest`：安装后的快速自检。
-- `python -m pytest tests -q`：112 项测试，检查的都是物理规律和两类之间的不变量，而不是快照（依赖 PyTorch 的两项在未安装时自动跳过）。主要包括：各倍频程 RT60 符合 Eyring 公式（误差在 12% 以内，实测约 5%），直混比随距离的变化符合扩散场理论（2 dB 以内），指向性只改变直达声不改变混响尾，设备输出电平校准到目标值（0.05 dB 以内），失真随音量增大，窄带通话 4.5 kHz 以上能量低于 -35 dB，成对渲染在语音到来之前逐样本一致，场景标签内外的能量差大于 10 dB，`configs/default.yaml` 与代码默认值一致。
-- `python -m replay_opus judge`：用第三方重放检测器做同场景对照验收，见上一节。
+- `python -m pytest tests -q`：121 项测试，检查的都是物理规律和两类之间的不变量，而不是快照（依赖 PyTorch 的两项在未安装时自动跳过）。主要包括：各倍频程 RT60 符合 Eyring 公式（误差在 12% 以内，实测约 5%），直混比随距离的变化符合扩散场理论（2 dB 以内），指向性只改变直达声不改变混响尾，设备输出电平校准到目标值（0.05 dB 以内），失真随音量增大，窄带通话 4.5 kHz 以上能量低于 -35 dB，成对渲染在语音到来之前逐样本一致，场景标签内外的能量差大于 10 dB，`configs/default.yaml` 与代码默认值一致。
+- `python -m replay_opus judge`：用第三方重放检测器做同场景对照验收，见上一节。输入是 `render` 的 `manifest.jsonl`。
 - **下游验证只有一条路**：留一小份**真实录制**的评测集，在你目标的真实家庭和车里，分别录真人说话和真实电视、手机的外放。仿真训出的模型在这份集合上的表现，才是唯一能说明问题的指标。公开数据里，ReMASC 录了室内、户外和车内环境下的真人与重放语音，可以作为参照。
 
 ## 已知局限

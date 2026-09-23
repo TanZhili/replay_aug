@@ -219,6 +219,26 @@ def cmd_render(args: argparse.Namespace) -> int:
     return 1 if failed and not written else 0
 
 
+def cmd_mix(args: argparse.Namespace) -> int:
+    from .mix import main as mix_main  # noqa: PLC0415
+
+    try:
+        config = load_config(args)
+        return mix_main(
+            args.speech_list,
+            args.playback_list,
+            args.noise_list,
+            args.rir_list,
+            args.output,
+            config=config,
+            count=args.count,
+            workers=args.workers,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+
 def cmd_scenes(args: argparse.Namespace) -> int:
     try:
         config = load_config(args)
@@ -430,6 +450,27 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one flat list 
     scenes.add_argument("--workers", type=int, default=default_workers)
     _add_config_args(scenes)
     scenes.set_defaults(func=cmd_scenes)
+
+    mix = sub.add_parser(
+        "mix",
+        help="microphone recording of user speech and device playback in one environment",
+    )
+    mix.add_argument("--speech-list", help="user speech (A); one path per line, optional text")
+    mix.add_argument(
+        "--playback-list",
+        help="audio rendered as device playback (B); may be the same list as --speech-list",
+    )
+    mix.add_argument("--noise-list", help="noise recordings, one path per line")
+    mix.add_argument("--rir-list", help="measured room impulse responses, one path per line")
+    mix.add_argument("--output", required=True, help="output directory")
+    mix.add_argument(
+        "--count",
+        type=int,
+        help="number of mixes; default is the longest list",
+    )
+    mix.add_argument("--workers", type=int, default=default_workers)
+    _add_config_args(mix)
+    mix.set_defaults(func=cmd_mix)
 
     audit = sub.add_parser("audit", help="check a render manifest for level / duration shortcuts")
     audit.add_argument("--manifest", required=True)
