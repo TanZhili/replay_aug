@@ -14,9 +14,14 @@ Timeline rules, all set in the ``scene`` config section:
 * one to three user utterances at random times, free to overlap the programme.
 
 Labels come in two lists, both in microphone time (placement plus direct-path delay)
-and cut to the scene: ``utterances``, one per placed utterance with its text, speaker
-and device, and ``segments``, the voice activity inside them, each pointing back to
-its utterance.
+and cut to the scene: ``utterances``, one per placed utterance with its text, speaker,
+device and playback form, and ``segments``, the voice activity inside them, each
+pointing back to its utterance.
+
+Every device source draws its own playback form. Inputs of origin ``recorded`` were
+picked up by a microphone in some room already: they never speak as the live user,
+and they only enter programmes of the ``rerecorded`` form, where they are played as
+they are instead of passing through a remote room first.
 """
 
 from __future__ import annotations
@@ -63,6 +68,9 @@ class SceneComposer:
         self.scenes = SceneRenderer(config)
         self.sr = config.sr_internal
         self.utterances = utterances
+        origins = [u.origin or config.render.origin for u in utterances]
+        self.dry = {i for i, origin in enumerate(origins) if origin == "dry"}
+        self.recorded = set(range(len(utterances))) - self.dry
         self._cache: OrderedDict[int, tuple[np.ndarray, list[tuple[float, float]]]] = OrderedDict()
         by_speaker: dict[str, list[int]] = defaultdict(list)
         for index, utt in enumerate(utterances):
@@ -85,12 +93,27 @@ class SceneComposer:
         self._cache.move_to_end(index)
         return self._cache[index]
 
-    def _pool(self, rng: np.random.Generator, n_voices: int, exclude: set[str]) -> list[int]:
+    def _pool(
+        self,
+        rng: np.random.Generator,
+        n_voices: int,
+        exclude: set[str],
+        allowed: set[int] | None = None,
+    ) -> list[int]:
+        """Utterances to draw from: ``n_voices`` voices not in ``exclude``, restricted to
+        ``allowed`` indices. Empty when nothing qualifies."""
+
+        def ok(i: int) -> bool:
+            return allowed is None or i in allowed
+
         if not self.by_speaker:
-            return list(range(len(self.utterances)))
+            return [i for i in range(len(self.utterances)) if ok(i)]
         voices = [v for v in self.by_speaker if v not in exclude] or list(self.by_speaker)
+        voices = [v for v in voices if any(ok(i) for i in self.by_speaker[v])]
+        if not voices:
+            return []
         chosen = rng.choice(len(voices), size=min(n_voices, len(voices)), replace=False)
-        return [i for c in chosen for i in self.by_speaker[voices[int(c)]]]
+        return [i for c in chosen for i in self.by_speaker[voices[int(c)]] if ok(i)]
 
     def _place(self, track: np.ndarray, index: int, start: int, placed: list[dict]) -> None:
         """Add an utterance to a track and note where its speech lies (in track time)."""
@@ -104,11 +127,19 @@ class SceneComposer:
         parts = [(offset + s0, offset + s1) for s0, s1 in speech]
         placed.append({"utt": utt.key, "text": utt.text, "speaker": utt.speaker, "parts": parts})
 
-    def _programme(self, n: int, rng: np.random.Generator, continuous: bool, exclude: set[str]):
+    def _programme(
+        self, n: int, rng: np.random.Generator, continuous: bool, exclude: set[str], form: str
+    ):
+        """A programme timeline. Dry and already-recorded material go on separate tracks:
+        only the dry one passes through the form's recording stage."""
         cfg = self.config.scene
-        pool = self._pool(rng, sample_int(rng, cfg.device_voices), exclude)
+        allowed = None if form == "rerecorded" else self.dry
+        pool = self._pool(rng, sample_int(rng, cfg.device_voices), exclude, allowed)
         track = np.zeros(n)
+        recorded = np.zeros(n)
         placed: list[dict] = []
+        if not pool:
+            return track, recorded, placed, []
         if continuous:
             cursor = -int(rng.uniform(0.0, 4.0) * self.sr)  # the TV was already on
             end = n
@@ -117,14 +148,17 @@ class SceneComposer:
             end = min(n, cursor + int(rng.uniform(2.0, 8.0) * self.sr))
         while cursor < end:
             index = pool[int(rng.integers(len(pool)))]
-            self._place(track, index, cursor, placed)
+            self._place(recorded if index in self.recorded else track, index, cursor, placed)
             cursor += len(self._dry(index)[0]) + int(sample_range(rng, cfg.device_gap_s) * self.sr)
         voices = sorted({p["speaker"] for p in placed if p["speaker"]})
-        return track, placed, voices
+        return track, recorded, placed, voices
 
     def _live_track(self, n: int, rng: np.random.Generator, exclude: set[str]):
         cfg = self.config.scene
-        pool = self._pool(rng, 1, exclude)
+        track = np.zeros(n)
+        pool = self._pool(rng, 1, exclude, self.dry)
+        if not pool:
+            return track, []
         picks = [
             pool[int(rng.integers(len(pool)))] for _ in range(sample_int(rng, cfg.live_utterances))
         ]
@@ -134,7 +168,6 @@ class SceneComposer:
             and sum(len(self._dry(i)[0]) for i in picks) + (len(picks) + 1) * gaps_min * self.sr > n
         ):
             picks.pop()
-        track = np.zeros(n)
         placed: list[dict] = []
         if not picks:
             return track, placed
@@ -171,9 +204,22 @@ class SceneComposer:
             n_devices = 2 if rng.random() < cfg.second_device_prob else 1
             for d in range(n_devices):
                 continuous = rng.random() < cfg.device_continuous_prob
-                track, programme, voices = self._programme(n, rng, continuous, set())
+                form = self.scenes.draw_form(scene, d)
+                if form != "rerecorded" and not self.dry:
+                    form = "rerecorded"  # only recorded material to play
+                track, recorded, programme, voices = self._programme(
+                    n, rng, continuous, set(), form
+                )
+                if not programme:
+                    continue
                 voices_used.update(voices)
-                source = self.scenes.render_device(scene, track, index=d)
+                source = self.scenes.render_device(
+                    scene,
+                    track if np.any(track) else None,
+                    index=d,
+                    form=form,
+                    recorded=recorded if np.any(recorded) else None,
+                )
                 signal = fit_length(source.signal, n)
                 name = f"device{d}"
                 mix += signal
@@ -183,6 +229,7 @@ class SceneComposer:
                     "source": name,
                     "device": source.meta["device"],
                     "content": source.meta["content"]["content"],
+                    "playback_form": form,
                 }
                 placed += [{**p, **extra, "delay": source.delay_s} for p in programme]
                 sources[name] = {

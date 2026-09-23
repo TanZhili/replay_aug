@@ -19,7 +19,9 @@ spoof class a recorded-then-replayed second pass. The comparisons carry the mean
 * ``live`` vs ``dry`` - does it simply react to room and noise? If so, only same-scene
   comparisons mean anything.
 * ``device`` vs ``live`` - how much replay evidence it finds in our device renderings,
-  within the same scene; set it against the ``replay`` row.
+  within the same scene; set it against the ``replay`` row. It is also broken down by
+  playback form: forms with a recording stage in front of the loudspeaker should read
+  as more replayed than a single pass.
 
 ``--reference`` scores a list of your own labelled recordings as well, which is the
 only way to learn whether a detector works on real audio like yours.
@@ -100,7 +102,14 @@ def _replay_control(renderer: UtteranceRenderer, record: dict) -> tuple[np.ndarr
 
 def _summary(scores: dict[str, dict[str, float]], meta: dict[str, dict]) -> dict:
     by_condition = {c: np.array([s[c] for s in scores.values() if c in s]) for c in CONDITIONS}
-    out: dict = {"median": {}, "auc": {}, "paired": {}, "by_device": {}, "by_environment": {}}
+    out: dict = {
+        "median": {},
+        "auc": {},
+        "paired": {},
+        "by_device": {},
+        "by_playback_form": {},
+        "by_environment": {},
+    }
     for condition, values in by_condition.items():
         if len(values):
             out["median"][condition] = round(float(np.median(values)), 3)
@@ -120,10 +129,14 @@ def _summary(scores: dict[str, dict[str, float]], meta: dict[str, dict]) -> dict
                 "ci95": [round(lo, 3), round(hi, 3)],
                 "median_diff": round(float(np.median(diffs)), 3),
             }
-    for field, key in (("by_device", "device"), ("by_environment", "environment")):
+    for field, key in (
+        ("by_device", "device"),
+        ("by_playback_form", "playback_form"),
+        ("by_environment", "environment"),
+    ):
         groups: dict[str, list[float]] = defaultdict(list)
         for pair, s in scores.items():
-            if "device" in s and "live" in s:
+            if "device" in s and "live" in s and meta[pair].get(key) is not None:
                 groups[meta[pair][key]].append(s["device"] - s["live"])
         for name, diffs in sorted(groups.items()):
             wins = int(np.sum(np.array(diffs) > 0))
@@ -190,6 +203,7 @@ def run_judge(
         meta[pair] = {
             "environment": any_record["scene"]["environment"],
             "device": device_record["source"]["device"] if device_record else None,
+            "playback_form": device_record.get("playback_form") if device_record else None,
         }
         clips[pair] = {}
         for label, record in records.items():
@@ -234,8 +248,12 @@ def format_judge_report(result: dict) -> str:
                 f"   same scene, {key}: {p['win_rate']:.0%} of {p['n']} "
                 f"(95% CI {lo:.0%}-{hi:.0%}), median difference {p['median_diff']:+.2f}"
             )
-        for field, title in (("by_device", "device"), ("by_environment", "environment")):
-            if d[field]:
+        for field, title in (
+            ("by_device", "device"),
+            ("by_playback_form", "playback form"),
+            ("by_environment", "environment"),
+        ):
+            if d.get(field):
                 cells = [f"{k} {v['win_rate']:.0%} (n={v['n']})" for k, v in d[field].items()]
                 lines.append(f"   device>live by {title}: " + ", ".join(cells))
         if "reference" in d:

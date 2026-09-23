@@ -275,6 +275,13 @@ def _fractional_delay(delay: np.ndarray, n_fft: int) -> tuple[np.ndarray, np.nda
     return index, kernel, (index >= 0) & (index < n_fft)
 
 
+def early_part_s(room: Room, early_ms: float | None = None) -> float:
+    """Length of the image-source part after the direct path: twice the mixing time."""
+    if early_ms is not None:
+        return early_ms / 1000.0
+    return float(np.clip(2.0 * room.mixing_time(), 0.025, 0.08))
+
+
 def room_impulse_response(
     room: Room,
     src: np.ndarray,
@@ -301,10 +308,7 @@ def room_impulse_response(
     rt60 = room.rt60()
     distance = max(float(np.linalg.norm(src - mic)), 0.05)
 
-    if early_ms is None:
-        t_early = float(np.clip(2.0 * room.mixing_time(), 0.025, 0.08))
-    else:
-        t_early = early_ms / 1000.0
+    t_early = early_part_s(room, early_ms)
     xfade = 0.004
     t_mix = distance / c + t_early
     arrival, amplitude, order = _image_amplitudes(

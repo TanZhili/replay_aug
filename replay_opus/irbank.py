@@ -19,6 +19,7 @@ from scipy import signal
 from .dsp import EPS, resample_to, to_mono
 from .metrics import (
     describe_ir,
+    direct_index,
     energy_decay_curve,
     estimate_drr,
     estimate_t60,
@@ -161,13 +162,15 @@ def synth_ir(
         )
         late += signal.sosfilt(sos, noise) * np.exp(-amplitude_decay_rate(band_t60) * t)
 
-    direct = np.zeros(length)
-    direct[0] = 1.0
     # Suppress the very beginning of the late field so the direct path stays isolated.
     late[: max(1, int(sr * 0.0025))] = 0.0
-
-    h = retarget_t60(direct + late, sr, t60)
-    h = set_drr(h, sr, drr)
+    # Shape and scale the late field on its own: before scaling, its noise peaks can
+    # exceed the unit direct path, and anything locating the direct by its maximum
+    # would then pick a late-field peak and throw the real direct sound away.
+    late = retarget_t60(late, sr, t60)
+    late *= np.sqrt(10.0 ** (-drr / 10.0) / (float(np.sum(late**2)) + EPS))
+    h = late
+    h[0] += 1.0
     norm = np.sqrt(np.sum(h**2))
     return h / (norm + EPS)
 
@@ -182,6 +185,42 @@ def scale_for_distance(h: np.ndarray, sr: int, distance_m: float) -> np.ndarray:
     direct, _, _, _ = split_direct_late(h, sr)
     e_direct = float(np.sum(direct**2))
     return h / (np.sqrt(e_direct) + EPS) / max(distance_m, 0.05)
+
+
+def graft_tail(
+    modelled: np.ndarray, measured: np.ndarray, sr: int, split_s: float, fade_s: float = 0.005
+) -> np.ndarray:
+    """Keep ``modelled`` up to ``split_s`` after its direct path, then continue with the
+    measured IR's late field scaled to the modelled late energy.
+
+    A measured IR was recorded from a measurement loudspeaker at one position, so its
+    direct sound and early reflections belong to that loudspeaker and that spot. The
+    modelled head keeps what depends on the source actually placed in the scene - its
+    distance, its directivity (a mouth is not a loudspeaker), its early reflections -
+    and the late energy that goes with them, so the direct-to-reverberant ratio still
+    follows the scene. The measured tail brings the real room's decay and colour.
+    """
+    modelled = np.asarray(modelled, dtype=np.float64)
+    measured = np.asarray(measured, dtype=np.float64)
+    split = round(split_s * sr)
+    fade = max(1, round(fade_s * sr))
+    seam = direct_index(modelled) + split
+    source = direct_index(measured) + split
+    if seam >= len(modelled) or source + fade >= len(measured) or seam < fade:
+        return modelled
+    e_model = float(np.sum(modelled[seam:] ** 2))
+    e_tail = float(np.sum(measured[source:] ** 2))
+    if e_model < EPS or e_tail < EPS:
+        return modelled
+    tail = measured[source - fade :] * np.sqrt(e_model / e_tail)
+    ramp = np.sin(0.5 * np.pi * (np.arange(fade) + 0.5) / fade) ** 2
+    head = modelled[:seam].copy()
+    head[-fade:] *= 1.0 - ramp
+    tail[:fade] *= ramp
+    out = np.zeros(max(len(head), seam - fade + len(tail)))
+    out[: len(head)] += head
+    out[seam - fade : seam - fade + len(tail)] += tail
+    return out
 
 
 @dataclass
@@ -267,6 +306,7 @@ __all__ = [
     "amplitude_decay_rate",
     "estimate_drr",
     "filter_ir_stats",
+    "graft_tail",
     "load_ir",
     "prepare_ir",
     "reshape_ir",

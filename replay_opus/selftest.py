@@ -131,6 +131,8 @@ def run_selftest(output_dir: Path | None = None) -> int:
     config.capture.agc_prob = 0.0
     config.content.weights = {"broadcast": 1.0}
     config.content.profiles = {"broadcast": {"codecs": {"none": 1.0}, "source_room_prob": 0.0}}
+    # A produced programme is silent before its speech; recorded forms carry room tone.
+    config.playback.forms = {"single": 1.0}
     renderer = UtteranceRenderer(config)
     speech = _speech_like(rng)
     live, device = renderer.render(speech, SR, "selftest", 0)
@@ -152,6 +154,29 @@ def run_selftest(output_dir: Path | None = None) -> int:
         "same seed, same output",
         all(np.array_equal(a.audio, b.audio) for a, b in zip((live, device), again, strict=True)),
         "bit-identical",
+    )
+
+    print("Playback forms")
+    looks = {}
+    for form in ("single", "rerecorded", "replay"):
+        form_config = Config()
+        form_config.playback.forms = {form: 1.0}
+        _, clip = UtteranceRenderer(form_config).render(speech, SR, "selftest", 1)
+        looks[form] = (
+            clip.label,
+            clip.meta["playback_form"],
+            clip.meta["source"]["device"],
+            [d["pos_m"] for d in clip.meta["source"]["drivers"]],
+        )
+    check(
+        "every form is labelled device",
+        all(v[0] == "device" and v[1] == form for form, v in looks.items()),
+        ", ".join(looks),
+    )
+    check(
+        "every form plays from the same loudspeaker",
+        len({repr(v[2:]) for v in looks.values()}) == 1,
+        looks["single"][2],
     )
 
     print("Full-duplex scenes")

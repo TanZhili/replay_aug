@@ -7,6 +7,7 @@ and ACE Challenge corpora, so numbers here are comparable with their metadata.
 from __future__ import annotations
 
 import numpy as np
+from scipy import fft as sp_fft
 
 from .dsp import EPS
 
@@ -75,10 +76,42 @@ def estimate_c50(h: np.ndarray, sr: int, early_ms: float = 50.0) -> float:
     return float(10.0 * np.log10((early + EPS) / (late + EPS)))
 
 
+def spectral_std(
+    h: np.ndarray,
+    sr: int,
+    f_lo: float = 300.0,
+    f_hi: float = 7000.0,
+    smooth_octaves: float = 1.0 / 3.0,
+) -> float:
+    """Spread of an IR's log-magnitude spectrum around its smoothed envelope, in dB.
+
+    Above the Schroeder frequency and beyond the critical distance, one room's
+    transfer function scatters by about 5.6 dB and two rooms in series by about 8 dB
+    (Gaubitch & Looney, ICASSP 2024), which is how a second recording pass shows in
+    the acoustics. A close source pulls the value down: its direct sound flattens the
+    response. The envelope is removed first, so spectral tilt from absorption or a
+    source's directivity does not count as spread.
+    """
+    h = np.asarray(h, dtype=np.float64)
+    n = sp_fft.next_fast_len(max(2 * len(h), 8192), real=True)
+    level = 10.0 * np.log10(np.abs(sp_fft.rfft(h, n)) ** 2 + EPS)
+    freqs = sp_fft.rfftfreq(n, 1.0 / sr)
+    band = np.flatnonzero((freqs >= f_lo) & (freqs <= min(f_hi, 0.45 * sr)))
+    if band.size < 16:
+        return float("nan")
+    csum = np.concatenate([[0.0], np.cumsum(level)])
+    half = 2.0 ** (smooth_octaves / 2.0)
+    lo = np.searchsorted(freqs, freqs[band] / half)
+    hi = np.searchsorted(freqs, freqs[band] * half, side="right")
+    envelope = (csum[hi] - csum[lo]) / np.maximum(hi - lo, 1)
+    return float(np.std(level[band] - envelope))
+
+
 def describe_ir(h: np.ndarray, sr: int) -> dict:
     return {
         "t60_s": round(estimate_t60(h, sr), 4),
         "drr_db": round(estimate_drr(h, sr), 2),
         "c50_db": round(estimate_c50(h, sr), 2),
+        "sstd_db": round(spectral_std(h, sr), 2),
         "length_ms": round(1000.0 * len(h) / sr, 1),
     }

@@ -35,7 +35,9 @@ def _config(**scene) -> Config:
 
 
 def test_segments_sit_where_the_stems_have_energy(utterances):
-    composer = SceneComposer(_config(types={"both": 1.0}), utterances)
+    config = _config(types={"both": 1.0})
+    config.playback.forms = {"single": 1.0}  # recorded forms play their room tone between words
+    composer = SceneComposer(config, utterances)
     checked = 0
     for index in range(4):
         scene = composer.compose(index)

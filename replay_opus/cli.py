@@ -6,16 +6,16 @@ import argparse
 import json
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import yaml
 
-from .config import Config
+from .config import ORIGINS, Config, parse_forms
 from .detectors import DETECTORS
 from .irbank import IRBank, filter_ir_stats
+from .jobs import run_jobs, save_config
 from .measure import SweepSpec, measure_chain, sweep_with_padding
 from .metrics import describe_ir
 from .pathlist import Utterance, read_utterances
@@ -44,12 +44,6 @@ def _apply_set(data: dict, assignment: str) -> None:
     node[parts[-1]] = yaml.safe_load(raw)
 
 
-def save_config(config: Config, out_root: Path) -> None:
-    """Keep the effective config with the outputs: scenes can be rebuilt from it."""
-    text = yaml.safe_dump(config.to_dict(), allow_unicode=True, sort_keys=False)
-    (out_root / "config.yaml").write_text(text, encoding="utf-8")
-
-
 def load_config(args: argparse.Namespace) -> Config:
     config = Config.load(args.config)
     if getattr(args, "set", None):
@@ -63,6 +57,10 @@ def load_config(args: argparse.Namespace) -> Config:
         config.variants_per_file = args.variants
     if getattr(args, "mode", None):
         config.render.mode = args.mode
+    if getattr(args, "origin", None):
+        config.render.origin = args.origin
+    if getattr(args, "forms", None):
+        config.playback.forms = parse_forms(args.forms, "--forms")
     config.validate()
     return config
 
@@ -78,11 +76,11 @@ def _init_render_worker(config_dict: dict) -> None:
     _WORKER["renderer"] = UtteranceRenderer(Config.from_dict(config_dict))
 
 
-def _render_job(job: tuple[str, str, str | None, str | None, int, str, int]) -> list[dict]:
-    path, key, text, speaker, variant, out_root, n_variants = job
+def _render_job(job: tuple) -> list[dict]:
+    path, key, text, speaker, origin, playback, variant, out_root, n_variants = job
     renderer = _WORKER["renderer"]
     audio, sr = sf.read(path, always_2d=False)
-    clips = renderer.render(np.asarray(audio, dtype=np.float64), sr, key, variant)
+    clips = renderer.render(np.asarray(audio, dtype=np.float64), sr, key, variant, origin, playback)
     stem = Path(key).with_suffix("").as_posix()
     output = renderer.config.output
     records = []
@@ -105,12 +103,10 @@ def _render_job(job: tuple[str, str, str | None, str | None, int, str, int]) -> 
     return records
 
 
-def _init_scene_worker(
-    config_dict: dict, utterances: list[tuple[str, str, str | None, str | None]]
-) -> None:
+def _init_scene_worker(config_dict: dict, utterances: list[tuple]) -> None:
     from .compose import SceneComposer  # noqa: PLC0415
 
-    utts = [Utterance(Path(p), k, t, s) for p, k, t, s in utterances]
+    utts = [Utterance(Path(p), k, t, s, o) for p, k, t, s, o in utterances]
     _WORKER["composer"] = SceneComposer(Config.from_dict(config_dict), utts)
 
 
@@ -136,63 +132,23 @@ def _scene_job(job: tuple[int, str]) -> list[dict]:
     return [record]
 
 
-def _run_jobs(
-    jobs, worker, initializer, initargs, workers: int, manifest_path: Path
-) -> tuple[int, int]:
-    written = failed = 0
-    total = len(jobs)
-
-    def record_all(records: list[dict], manifest) -> None:
-        nonlocal written, failed
-        for record in records:
-            manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
-            if "error" in record:
-                failed += 1
-                print(
-                    f"  FAILED {record.get('input', record.get('job'))}: {record['error']}",
-                    file=sys.stderr,
-                )
-            else:
-                written += 1
-
-    with open(manifest_path, "w", encoding="utf-8") as manifest:
-        if workers == 1:
-            initializer(*initargs)
-            for done, job in enumerate(jobs, start=1):
-                try:
-                    records = worker(job)
-                except Exception as exc:  # noqa: BLE001 - keep going, report at the end
-                    records = [{"job": repr(job[:2]), "error": repr(exc)}]
-                record_all(records, manifest)
-                if done % 10 == 0 or done == total:
-                    print(f"  {done}/{total}", end="\r", flush=True)
-        else:
-            with ProcessPoolExecutor(
-                max_workers=workers, initializer=initializer, initargs=initargs
-            ) as pool:
-                futures = {pool.submit(worker, job): job for job in jobs}
-                for done, future in enumerate(as_completed(futures), start=1):
-                    try:
-                        records = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        records = [{"job": repr(futures[future][:2]), "error": repr(exc)}]
-                    record_all(records, manifest)
-                    if done % 10 == 0 or done == total:
-                        print(f"  {done}/{total}", end="\r", flush=True)
-    print()
-    return written, failed
-
-
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
 
 
 def cmd_render(args: argparse.Namespace) -> int:
+    from .render import resolve_input  # noqa: PLC0415
+
     try:
         config = load_config(args)
         utterances = read_utterances(args.input, suffixes=AUDIO_SUFFIXES)
-        _init_render_worker(config.to_dict())  # fail fast on bad lists before forking
+        for u in utterances:  # fail fast, naming the input, before any work is done
+            try:
+                resolve_input(config, u.origin, u.playback)
+            except ValueError as exc:
+                raise ValueError(f"{u.key}: {exc}") from None
+        _init_render_worker(config.to_dict())  # and on bad lists in the config
     except (FileNotFoundError, ValueError) as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -202,17 +158,17 @@ def cmd_render(args: argparse.Namespace) -> int:
     save_config(config, out_root)
     n_variants = config.variants_per_file
     jobs = [
-        (str(u.path), u.key, u.text, u.speaker, v, str(out_root), n_variants)
+        (str(u.path), u.key, u.text, u.speaker, u.origin, u.playback, v, str(out_root), n_variants)
         for u in utterances
         for v in range(n_variants)
     ]
-    per_job = 2 if config.render.mode == "paired" else 1
+    recorded = sum(1 for u in utterances if (u.origin or config.render.origin) == "recorded")
     print(
-        f"{len(utterances)} utterances x {n_variants} variants, mode {config.render.mode} "
-        f"-> {len(jobs) * per_job} files"
+        f"{len(utterances)} inputs ({recorded} recorded) x {n_variants} variants, "
+        f"mode {config.render.mode}, playback forms {config.playback.forms}"
     )
     manifest = out_root / "manifest.jsonl"
-    written, failed = _run_jobs(
+    written, failed = run_jobs(
         jobs, _render_job, _init_render_worker, (config.to_dict(),), args.workers, manifest
     )
     print(f"wrote {written} files, {failed} failed\nmanifest: {manifest}")
@@ -233,6 +189,7 @@ def cmd_mix(args: argparse.Namespace) -> int:
             config=config,
             count=args.count,
             workers=args.workers,
+            playback_origin=args.playback_origin,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(exc, file=sys.stderr)
@@ -245,7 +202,7 @@ def cmd_scenes(args: argparse.Namespace) -> int:
         if args.stems:
             config.scene.save_stems = True
         utterances = read_utterances(args.input, suffixes=AUDIO_SUFFIXES)
-        packed = [(str(u.path), u.key, u.text, u.speaker) for u in utterances]
+        packed = [(str(u.path), u.key, u.text, u.speaker, u.origin) for u in utterances]
         _init_scene_worker(config.to_dict(), packed)
     except (FileNotFoundError, ValueError) as exc:
         print(exc, file=sys.stderr)
@@ -257,7 +214,7 @@ def cmd_scenes(args: argparse.Namespace) -> int:
     jobs = [(i, str(out_root)) for i in range(args.start, args.start + args.count)]
     print(f"{args.count} scenes from {len(utterances)} utterances")
     manifest = out_root / "manifest.jsonl"
-    written, failed = _run_jobs(
+    written, failed = run_jobs(
         jobs, _scene_job, _init_scene_worker, (config.to_dict(), packed), args.workers, manifest
     )
     print(f"wrote {written} scenes, {failed} failed\nmanifest: {manifest}")
@@ -418,6 +375,19 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_input_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--origin",
+        choices=ORIGINS,
+        help="what inputs without their own 'origin' field are: dry speech (TTS, close-talk) "
+        "or recorded (a person already recorded in a room)",
+    )
+    parser.add_argument(
+        "--forms",
+        help="playback forms of device clips, e.g. 'replay' or 'single=2,rerecorded=1,replay=1'",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one flat list of options
     parser = argparse.ArgumentParser(
         prog="replay_opus",
@@ -435,6 +405,7 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one flat list 
     render.add_argument("--mode", choices=["paired", "mixed", "live", "device"])
     render.add_argument("--workers", type=int, default=default_workers)
     _add_config_args(render)
+    _add_input_args(render)
     render.set_defaults(func=cmd_render)
 
     scenes = sub.add_parser(
@@ -449,6 +420,7 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one flat list 
     scenes.add_argument("--stems", action="store_true", help="also write per-source stems")
     scenes.add_argument("--workers", type=int, default=default_workers)
     _add_config_args(scenes)
+    _add_input_args(scenes)
     scenes.set_defaults(func=cmd_scenes)
 
     mix = sub.add_parser(
@@ -469,7 +441,16 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one flat list 
         help="number of mixes; default is the longest list",
     )
     mix.add_argument("--workers", type=int, default=default_workers)
+    mix.add_argument(
+        "--playback-origin",
+        choices=ORIGINS,
+        help="origin of playback lines without their own field (default: render.origin)",
+    )
     _add_config_args(mix)
+    mix.add_argument(
+        "--forms",
+        help="playback forms of the device, e.g. 'replay' or 'single=2,rerecorded=1,replay=1'",
+    )
     mix.set_defaults(func=cmd_mix)
 
     audit = sub.add_parser("audit", help="check a render manifest for level / duration shortcuts")

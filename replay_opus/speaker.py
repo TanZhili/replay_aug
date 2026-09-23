@@ -42,6 +42,8 @@ from .dsp import (
     sample_int,
     sample_range,
     soft_clip,
+    speech_level_db,
+    speech_level_from_energy,
     to_mono,
 )
 from .dynamics import compressor, limiter
@@ -490,7 +492,7 @@ def device_emission(program: np.ndarray, sr: int, device: Device) -> tuple[list[
     """Per-driver pressure at 1 m on-axis, in pascals."""
     x = np.asarray(program, dtype=np.float64)
     target = device.level_dba - device.max_spl_db + FULL_SCALE_SINE_DB
-    x = x * 10.0 ** ((target - active_level_db(x, sr)) / 20.0)
+    x = x * 10.0 ** ((target - speech_level_db(x, sr)) / 20.0)
     dsp = device.dsp
     meta: dict = {}
 
@@ -516,12 +518,10 @@ def device_emission(program: np.ndarray, sr: int, device: Device) -> tuple[list[
         y = signal.fftconvolve(x, fir)[: len(x)] if fir is not None else x
         outputs.append(apply_sos(y, sos))
 
-    # Calibrate the power sum of all drivers to the target level at 1 m.
+    # Calibrate the power sum of all drivers to the target speech level at 1 m.
     hop = max(1, int(0.02 * sr))
     energy = sum(frame_energy(a_weight(y, sr), hop) for y in outputs)
-    energy_db = 10.0 * np.log10(energy + EPS)
-    active = energy_db > energy_db.max() - 35.0
-    level = 10.0 * np.log10(np.mean(energy[active]) + EPS)
+    level = speech_level_from_energy(energy)
     want = 20.0 * np.log10(P_REF) + device.level_dba
     gain = 10.0 ** ((want - level) / 20.0)
     return [y * gain for y in outputs], meta

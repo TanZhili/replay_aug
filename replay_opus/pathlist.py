@@ -10,7 +10,10 @@ in. A list is explicit, diffable, and reusable across runs.
 
 Utterance lists may carry more than the path: ``path<TAB>text`` or
 ``path<TAB>speaker<TAB>text`` per line, or a ``.jsonl`` file with ``audio``, ``text``
-and ``speaker`` keys. Text and speaker pass straight through to the labels.
+and ``speaker`` keys. Text and speaker pass straight through to the labels. A JSONL
+line may also say what the input is and how to play it: ``origin`` (``dry`` for TTS
+or close-talk speech, ``recorded`` for a person already recorded in a room) and
+``playback`` (a playback form, a list of forms, or ``{form: weight}``).
 """
 
 from __future__ import annotations
@@ -21,6 +24,9 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+ORIGINS = ("dry", "recorded")
 
 
 def read_text_lines(path: Path) -> list[str]:
@@ -122,6 +128,8 @@ class Utterance:
     key: str  # path relative to the list's common root: file naming and RNG key
     text: str | None = None
     speaker: str | None = None
+    origin: str | None = None  # dry | recorded; None leaves it to render.origin
+    playback: Any = None  # playback forms for this input; None leaves it to playback.forms
 
 
 def read_utterances(
@@ -131,8 +139,9 @@ def read_utterances(
     kind = "input audio"
     path = _check_list_file(list_path, kind)
     entries: list[tuple[int, str]] = []
-    extras: dict[Path, tuple[str | None, str | None]] = {}
+    extras: dict[Path, tuple] = {}
     for lineno, raw in enumerate(read_text_lines(path), start=1):
+        origin = playback = None
         if path.suffix.lower() == ".jsonl":
             if not raw.strip() or raw.lstrip().startswith("#"):
                 continue
@@ -144,6 +153,11 @@ def read_utterances(
             if not head:
                 raise ValueError(f"{path}:{lineno}: needs an 'audio' (or 'path') field")
             text, speaker = record.get("text"), record.get("speaker")
+            origin, playback = record.get("origin"), record.get("playback")
+            if origin is not None and origin not in ORIGINS:
+                raise ValueError(
+                    f"{path}:{lineno}: origin must be one of {', '.join(ORIGINS)}, got {origin!r}"
+                )
         else:
             fields = raw.split("\t")
             head = fields[0]
@@ -156,11 +170,13 @@ def read_utterances(
             extras[_resolve_entry(_unquote(head), path.parent)] = (
                 text,
                 None if speaker is None else str(speaker),
+                origin,
+                playback,
             )
     paths = _resolve(entries, path, kind, suffixes)
     labels = relative_labels(paths)
     return [
-        Utterance(p, label, *extras.get(p, (None, None)))
+        Utterance(p, label, *extras.get(p, (None, None, None, None)))
         for p, label in zip(paths, labels, strict=True)
     ]
 

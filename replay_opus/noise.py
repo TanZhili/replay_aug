@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+from scipy import fft as sp_fft
 
 from .dsp import EPS, P_REF, a_weight, resample_to, rms, to_mono
 from .pathlist import read_path_list, relative_labels
@@ -26,10 +27,10 @@ AUDIO_SUFFIXES = (".wav", ".flac", ".ogg")
 
 def shaped_noise(n: int, sr: int, rng: np.random.Generator, psd_db) -> np.ndarray:
     """Gaussian noise whose power spectrum follows ``psd_db(freqs)``."""
-    n_fft = max(n, 16)
-    spectrum = np.fft.rfft(rng.standard_normal(n_fft))
-    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
-    shaped = np.fft.irfft(spectrum * 10.0 ** (psd_db(np.maximum(freqs, 1.0)) / 20.0), n_fft)[:n]
+    n_fft = sp_fft.next_fast_len(max(n, 16), real=True)
+    spectrum = sp_fft.rfft(rng.standard_normal(n_fft))
+    freqs = sp_fft.rfftfreq(n_fft, 1.0 / sr)
+    shaped = sp_fft.irfft(spectrum * 10.0 ** (psd_db(np.maximum(freqs, 1.0)) / 20.0), n_fft)[:n]
     return shaped / (np.std(shaped) + EPS)
 
 

@@ -16,7 +16,7 @@ from functools import lru_cache
 import av
 import numpy as np
 
-from .dsp import align_to, resample_to
+from .dsp import align_to, choose, resample_to
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,15 @@ def available_codecs() -> tuple[str, ...]:
             continue
         ok.append(name)
     return tuple(ok)
+
+
+def pick_codec(rng, weights: dict[str, float], available) -> str | None:
+    """Draw a codec from ``weights``. ``none``, or no usable codec, means no codec."""
+    usable = {k: w for k, w in weights.items() if k == "none" or k in available}
+    if not usable:
+        return None
+    name = choose(rng, usable)
+    return None if name == "none" else name
 
 
 @dataclass

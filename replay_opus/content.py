@@ -1,4 +1,4 @@
-"""Programme chains: what speech goes through before it reaches a loudspeaker.
+"""Delivery chains: what a voice goes through between its recording and a loudspeaker.
 
 broadcast   TV programmes. Mastering compression, loudness normalisation to EBU R128
             / ATSC A/85 (-23 / -24 LUFS), AAC / AC-3 / MP2 delivery, often a bed of
@@ -6,14 +6,16 @@ broadcast   TV programmes. Mastering compression, loudness normalisation to EBU 
 streaming   Online video, short-video apps, podcasts. -12 to -18 LUFS, heavier
             compression, AAC / Opus / MP3.
 phone_call  The far end of a call on speakerphone or car hands-free: telephone band,
-            far-end AGC and background, AMR-NB / G.711 (narrowband) or G.722 / Opus
-            (wideband).
+            far-end AGC, AMR-NB / G.711 (narrowband) or G.722 / Opus (wideband).
 radio       FM (pre-emphasis, dense multiband processing, clipping, 15 kHz low-pass,
             hiss) or digital radio (MP2 for DAB, AAC for DAB+).
 
-Some programmes were recorded in a room of their own - a vlog, on-location drama, a
-caller on speakerphone - so a share of them carries a small-room reverb before it
-is played into the listener's room: two rooms stacked, which no live talker has.
+Produced programmes (the ``single`` playback form) are close-miked; a share of them
+was recorded on location and carries a small room of its own (``source_room_prob``),
+and a share of calls a stand-in for the far end's background. When the voice was
+really recorded somewhere else first (the ``rerecorded`` form), the scene renders
+that room, that microphone and that noise in full and the chain is sampled with
+``remote=True``, which leaves both stand-ins out.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy import signal
 
-from .codecs import CodecSpec, codec_roundtrip
+from .codecs import CodecSpec, codec_roundtrip, pick_codec
 from .dsp import (
     EPS,
     active_level_db,
@@ -112,20 +114,21 @@ class ContentChain:
     params: dict = field(default_factory=dict)
 
 
-def _pick_codec(rng, weights: dict[str, float], available: set[str]) -> str | None:
-    usable = {k: w for k, w in weights.items() if k == "none" or k in available}
-    if not usable:
-        return None
-    name = choose(rng, usable)
-    return None if name == "none" else name
-
-
 def sample_content(
-    profile: str, preset: dict, rng: np.random.Generator, available_codecs: set[str], has_beds: bool
+    profile: str,
+    preset: dict,
+    rng: np.random.Generator,
+    available_codecs: set[str],
+    has_beds: bool,
+    remote: bool = False,
 ) -> ContentChain:
-    """Draw concrete settings for one programme of the given kind."""
+    """Draw concrete settings for one programme of the given kind.
+
+    ``remote`` marks a voice that was already recorded in a room of its own, so the
+    chain adds no location room and no stand-in far-end background.
+    """
     p: dict = {"loudness_lufs": round(sample_range(rng, preset["loudness_lufs"]), 2)}
-    if rng.random() < preset.get("source_room_prob", 0.0):
+    if rng.random() < preset.get("source_room_prob", 0.0) and not remote:
         p["source_room"] = {
             "t60_s": round(rng.uniform(0.15, 0.5), 3),
             "drr_db": round(rng.uniform(3.0, 15.0), 2),
@@ -136,9 +139,9 @@ def sample_content(
     if profile == "phone_call":
         band = choose(rng, preset["bands"])
         p["band"] = band
-        codec = _pick_codec(rng, preset[f"codecs_{band}"], available_codecs)
+        codec = pick_codec(rng, preset[f"codecs_{band}"], available_codecs)
         p["codec_rate"] = 8000 if band == "narrow" else 16000
-        if rng.random() < preset["far_end_noise_prob"]:
+        if rng.random() < preset["far_end_noise_prob"] and not remote:
             p["far_end_snr_db"] = round(sample_range(rng, preset["far_end_snr_db"]), 2)
     elif profile == "radio":
         p["fm"] = bool(rng.random() < preset["fm_prob"])
@@ -151,10 +154,10 @@ def sample_content(
             p["preemphasis_us"] = float(choose(rng, preset["preemphasis_us"]))
             p["fm_hiss_snr_db"] = round(sample_range(rng, preset["fm_hiss_snr_db"]), 2)
         else:
-            codec = _pick_codec(rng, preset["codecs"], available_codecs)
+            codec = pick_codec(rng, preset["codecs"], available_codecs)
             p["codec_rate"] = preset.get("codec_rate", 48000)
     else:
-        codec = _pick_codec(rng, preset["codecs"], available_codecs)
+        codec = pick_codec(rng, preset["codecs"], available_codecs)
         p["codec_rate"] = preset.get("codec_rate", 48000)
 
     if codec is not None:

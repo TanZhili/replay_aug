@@ -6,23 +6,38 @@ device and content *presets* live in code (``environment.py``, ``speaker.py``,
 ``content.py``); the YAML only needs to hold what you change - any preset key can
 be overridden, and new presets added, through the ``*_presets`` / ``presets``
 sections, which are deep-merged over the built-ins.
+
+Two words recur. An input's *origin* says what it already is: ``dry`` speech (TTS,
+or a person recorded close to a microphone in a quiet place) is taken as the sound
+leaving a mouth; a ``recorded`` input was picked up by a microphone in a room and
+carries that room and that microphone. A device clip's *form* says how the voice got
+to the loudspeaker: ``single`` (a produced programme, played once), ``rerecorded``
+(someone recorded elsewhere, then played here) or ``replay`` (someone recorded in
+this very room, then played here). Every form is labelled ``device``; the form is
+metadata, because nothing a microphone hears tells the three apart reliably.
 """
 
 from __future__ import annotations
 
 import copy
 import typing
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from .codecs import CODECS
 from .content import CONTENT_PROFILES
 from .environment import CAR_DEVICE_LAYOUTS, ENVIRONMENTS, ROOM_DEVICE_LAYOUTS
 from .speaker import DEVICE_PRESETS
 
 Range = float | list[float]
+
+ORIGINS = ("dry", "recorded")
+FORMS = ("single", "rerecorded", "replay")
+RECORDED_LIVE = ("skip", "passthrough")
+MEASURED_MODES = ("hybrid", "full")
 
 
 @dataclass
@@ -53,6 +68,7 @@ class ContentConfig:
 @dataclass
 class RoomConfig:
     measured: dict[str, str] = field(default_factory=dict)  # environment -> IR list
+    measured_mode: str = "hybrid"  # hybrid | full
     jitter_m: float = 0.05
     early_ms: float | None = None
 
@@ -70,6 +86,8 @@ class CaptureConfig:
     mic_ir_list: str | None = None
     highpass_prob: float = 0.7
     highpass_hz: Range = field(default_factory=lambda: [60.0, 150.0])
+    ns_prob: float = 0.0
+    ns_max_db: Range = field(default_factory=lambda: [8.0, 18.0])
     agc_prob: float = 0.4
     agc_target_dbfs: Range = field(default_factory=lambda: [-28.0, -18.0])
     agc_max_gain_db: float = 24.0
@@ -79,10 +97,61 @@ class CaptureConfig:
 
 
 @dataclass
+class SingleConfig:
+    contents: list[str] = field(default_factory=lambda: ["broadcast", "streaming", "radio"])
+
+
+@dataclass
+class RerecordedConfig:
+    environments: dict[str, float] = field(
+        default_factory=lambda: {
+            "living_room": 0.3,
+            "bedroom": 0.25,
+            "kitchen": 0.15,
+            "study": 0.2,
+            "car_cabin": 0.1,
+        }
+    )
+    distance_m: dict[str, Range] = field(
+        default_factory=lambda: {"default": [0.3, 2.5], "phone_call": [0.2, 1.0]}
+    )
+    contents: list[str] = field(default_factory=lambda: ["streaming", "phone_call"])
+    capture: dict[str, Any] = field(
+        default_factory=lambda: {"agc_prob": 0.8, "highpass_prob": 0.9, "ns_prob": 0.5}
+    )
+
+
+@dataclass
+class ReplayConfig:
+    distance_m: Range = field(default_factory=lambda: [0.2, 1.5])
+    capture: dict[str, Any] = field(
+        default_factory=lambda: {"agc_prob": 0.7, "highpass_prob": 0.8, "ns_prob": 0.2}
+    )
+    codecs: dict[str, float] = field(
+        default_factory=lambda: {"aac": 0.45, "opus": 0.2, "amr_nb": 0.1, "none": 0.25}
+    )
+    bitrate_kbps: dict[str, Range] = field(
+        default_factory=lambda: {"aac": [64.0, 128.0], "opus": [24.0, 64.0], "amr_nb": [7.95, 12.2]}
+    )
+
+
+@dataclass
+class PlaybackConfig:
+    forms: dict[str, float] = field(
+        default_factory=lambda: {"single": 0.5, "rerecorded": 0.3, "replay": 0.2}
+    )
+    single: SingleConfig = field(default_factory=SingleConfig)
+    rerecorded: RerecordedConfig = field(default_factory=RerecordedConfig)
+    replay: ReplayConfig = field(default_factory=ReplayConfig)
+
+
+@dataclass
 class RenderConfig:
     mode: str = "paired"  # paired | mixed | live | device
     device_prob: float = 0.5  # share of device renders in mixed mode
     tail_ms: float = 300.0
+    origin: str = "dry"  # dry | recorded, for inputs that do not say
+    recorded_live: str = "skip"  # live side of a recorded input: skip | passthrough
 
 
 @dataclass
@@ -129,6 +198,7 @@ class Config:
     talker: TalkerConfig = field(default_factory=TalkerConfig)
     devices: DeviceConfig = field(default_factory=DeviceConfig)
     content: ContentConfig = field(default_factory=ContentConfig)
+    playback: PlaybackConfig = field(default_factory=PlaybackConfig)
     room: RoomConfig = field(default_factory=RoomConfig)
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
@@ -166,6 +236,9 @@ class Config:
         for mapping in (self.room.measured, self.noise.lists, self.devices.measured):
             for key, value in list(mapping.items()):
                 mapping[key] = fix(value)
+        for overrides in (self.playback.rerecorded.capture, self.playback.replay.capture):
+            if overrides.get("mic_ir_list"):
+                overrides["mic_ir_list"] = fix(overrides["mic_ir_list"])
 
     # -- presets ---------------------------------------------------------------
 
@@ -192,22 +265,96 @@ class Config:
             raise ValueError(
                 f"render.mode must be paired, mixed, live or device, got {self.render.mode!r}"
             )
+        _one_of("render.origin", self.render.origin, ORIGINS)
+        _one_of("render.recorded_live", self.render.recorded_live, RECORDED_LIVE)
+        _one_of("room.measured_mode", self.room.measured_mode, MEASURED_MODES)
         if self.output.sr > self.sr_internal:
             raise ValueError("output.sr cannot exceed sr_internal")
         if self.output.format not in {"wav", "flac"}:
             raise ValueError(f"output.format must be wav or flac, got {self.output.format!r}")
         envs = self.environment_table()
-        for name, weight in self.environments.items():
-            if name not in envs:
-                raise ValueError(f"unknown environment {name!r}; known: {sorted(envs)}")
-            if weight < 0:
-                raise ValueError(f"negative weight for environment {name!r}")
-        if not any(w > 0 for w in self.environments.values()):
-            raise ValueError("environments needs at least one positive weight")
+        _check_weights("environments", self.environments, envs)
         unknown_types = set(self.scene.types) - {"both", "device_only", "live_only", "empty"}
         if unknown_types:
             raise ValueError(f"unknown scene type(s) {sorted(unknown_types)}")
-        _check_preset_links(envs, self.device_table(), self.content_table())
+        contents = self.content_table()
+        _check_preset_links(envs, self.device_table(), contents)
+        self._validate_playback(envs, contents)
+
+    def _validate_playback(self, envs: dict, contents: dict) -> None:
+        pb = self.playback
+        parse_forms(pb.forms, "playback.forms")
+        for form in ("single", "rerecorded"):
+            for name in getattr(pb, form).contents:
+                if name not in contents:
+                    raise ValueError(f"playback.{form}.contents names unknown profile {name!r}")
+        _check_weights("playback.rerecorded.environments", pb.rerecorded.environments, envs)
+        if "default" not in pb.rerecorded.distance_m:
+            raise ValueError("playback.rerecorded.distance_m needs a 'default' range")
+        for name in pb.rerecorded.distance_m:
+            if name != "default" and name not in contents:
+                raise ValueError(f"playback.rerecorded.distance_m names unknown profile {name!r}")
+        capture_config(pb.rerecorded.capture, "playback.rerecorded.capture")
+        capture_config(pb.replay.capture, "playback.replay.capture")
+        unknown = set(pb.replay.codecs) - set(CODECS) - {"none"}
+        if unknown:
+            raise ValueError(f"playback.replay.codecs names unknown codec(s) {sorted(unknown)}")
+        if not any(w > 0 for w in pb.replay.codecs.values()):
+            raise ValueError("playback.replay.codecs needs at least one positive weight")
+
+
+def parse_forms(spec, where: str = "playback forms") -> dict[str, float]:
+    """A weight table of playback forms.
+
+    Accepts a form name (``replay``), a comma list (``single,replay``),
+    ``name=weight`` pairs (``single=2,replay=1``), a list of names or a
+    ``{name: weight}`` mapping.
+    """
+    if isinstance(spec, str):
+        table: dict[str, float] = {}
+        for item in (s.strip() for s in spec.split(",")):
+            if not item:
+                continue
+            name, _, weight = item.partition("=")
+            table[name.strip()] = float(weight) if weight.strip() else 1.0
+    elif isinstance(spec, dict):
+        table = {str(k): float(v) for k, v in spec.items()}
+    elif isinstance(spec, (list, tuple)):
+        table = {str(name): 1.0 for name in spec}
+    else:
+        raise ValueError(f"{where}: expected a form name, a list or a mapping, got {spec!r}")
+    unknown = set(table) - set(FORMS)
+    if unknown:
+        raise ValueError(
+            f"{where}: unknown playback form(s) {sorted(unknown)}; choose from {', '.join(FORMS)}"
+        )
+    if any(w < 0 for w in table.values()) or not any(w > 0 for w in table.values()):
+        raise ValueError(f"{where}: weights must be non-negative with at least one positive")
+    return table
+
+
+def capture_config(overrides: dict[str, Any] | None, where: str = "capture") -> CaptureConfig:
+    """A capture chain for another microphone: built-in defaults plus ``overrides``."""
+    overrides = dict(overrides or {})
+    unknown = set(overrides) - {f.name for f in fields(CaptureConfig)}
+    if unknown:
+        raise ValueError(f"unknown {where} key(s) {sorted(unknown)}")
+    return replace(CaptureConfig(), **overrides)
+
+
+def _one_of(name: str, value: str, allowed: tuple[str, ...]) -> None:
+    if value not in allowed:
+        raise ValueError(f"{name} must be one of {', '.join(allowed)}, got {value!r}")
+
+
+def _check_weights(name: str, weights: dict[str, float], known: dict) -> None:
+    for key, weight in weights.items():
+        if key not in known:
+            raise ValueError(f"unknown environment {key!r} in {name}; known: {sorted(known)}")
+        if weight < 0:
+            raise ValueError(f"negative weight for {key!r} in {name}")
+    if not any(w > 0 for w in weights.values()):
+        raise ValueError(f"{name} needs at least one positive weight")
 
 
 def _check_preset_links(envs: dict, devices: dict, contents: dict) -> None:
@@ -251,4 +398,12 @@ def _build(cls, data: dict[str, Any]):
     return cls(**kwargs)
 
 
-__all__ = ["Config", "deep_merge"]
+__all__ = [
+    "FORMS",
+    "ORIGINS",
+    "CaptureConfig",
+    "Config",
+    "capture_config",
+    "deep_merge",
+    "parse_forms",
+]

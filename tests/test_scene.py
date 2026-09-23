@@ -20,9 +20,11 @@ from .conftest import SR, speech_like
 def test_paired_render_shares_scene_noise_and_capture(speech):
     config = Config()
     config.capture.agc_prob = 0.0  # a causal chain, so the lead-in must match exactly
-    # Programmes that stay silent before the speech: no codec floor, no call noise.
+    # Programmes that stay silent before the speech: no codec floor, no call noise, and
+    # no recording stage, whose room tone would play before the words.
     config.content.weights = {"broadcast": 1.0}
     config.content.profiles = {"broadcast": {"codecs": {"none": 1.0}, "source_room_prob": 0.0}}
+    config.playback.forms = {"single": 1.0}
     renderer = UtteranceRenderer(config)
     for variant in range(4):
         live, device = renderer.render(speech, SR, "utt", variant)
@@ -113,6 +115,7 @@ def test_noise_list_bed_list_and_mic_irs_are_used(tmp_path, rng, speech):
     }
     config.devices.weights = {"tv": 1.0}
     config.capture.mic_ir_list = str(tmp_path / "mics.txt")
+    config.playback.forms = {"single": 1.0}  # a programme with a delivery chain, so a bed
     live, device = UtteranceRenderer(config).render(speech, SR, "utt", 0)
     assert live.meta["scene"]["noise_source"] == "hum.wav"
     assert live.meta["scene"]["capture"]["mic_ir"] == "phone.wav"

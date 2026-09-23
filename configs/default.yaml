@@ -36,13 +36,38 @@ devices:                  # the playback side
   measured_prob: 0.5      # share of devices of that kind that use a measured response
   presets: {}             # e.g. {tv: {level_dba: [60, 72]}}
 
-content:                  # what the device is playing
+content:                  # the delivery chain in front of the loudspeaker
   bed_list: null          # music / effects recordings to mix under programmes
   weights: null           # replaces every device's content mix, e.g. {phone_call: 1.0}
   profiles: {}            # e.g. {streaming: {bed_prob: 0.8}}
 
+# How a device clip's voice reached the loudspeaker. Every form is labelled "device";
+# the form is recorded in the manifest (playback_form) and never becomes a label.
+playback:
+  forms: {single: 0.5, rerecorded: 0.3, replay: 0.2}
+  single:                 # a produced programme played once: TV, radio, podcasts
+    contents: [broadcast, streaming, radio]
+  rerecorded:             # recorded on a phone in another room, then played here:
+    environments:         # short videos, voice messages, calls
+      living_room: 0.3
+      bedroom: 0.25
+      kitchen: 0.15
+      study: 0.2
+      car_cabin: 0.1
+    distance_m:           # remote talker to that phone, per delivery chain
+      default: [0.3, 2.5]
+      phone_call: [0.2, 1.0]
+    contents: [streaming, phone_call]
+    capture: {agc_prob: 0.8, highpass_prob: 0.9, ns_prob: 0.5}   # over the capture defaults
+  replay:                 # recorded by a phone in this very room, then played back here
+    distance_m: [0.2, 1.5]                                       # phone to the recorded talker
+    capture: {agc_prob: 0.7, highpass_prob: 0.8, ns_prob: 0.2}
+    codecs: {aac: 0.45, opus: 0.2, amr_nb: 0.1, none: 0.25}      # how the recording was stored
+    bitrate_kbps: {aac: [64.0, 128.0], opus: [24.0, 64.0], amr_nb: [7.95, 12.2]}
+
 room:
   measured: {}            # environment -> list of measured IRs, one directory per room
+  measured_mode: hybrid   # hybrid: modelled direct + early part, measured tail; full: as measured
   jitter_m: 0.05          # randomised image positions; breaks up flutter echoes
   early_ms: null          # image-source part length; null picks 2x the mixing time
 
@@ -56,6 +81,8 @@ capture:                  # the device the full-duplex model listens through
   mic_ir_list: null                 # measured microphone responses replace the model
   highpass_prob: 0.7
   highpass_hz: [60.0, 150.0]
+  ns_prob: 0.0                      # noise suppression; set >0 if your device runs one
+  ns_max_db: [8.0, 18.0]
   agc_prob: 0.4
   agc_target_dbfs: [-28.0, -18.0]
   agc_max_gain_db: 24.0
@@ -67,6 +94,8 @@ render:                   # `render`: per-utterance clips
   mode: paired            # paired | mixed | live | device
   device_prob: 0.5        # device share in mixed mode
   tail_ms: 300.0          # reverberant tail kept after the input ends
+  origin: dry             # inputs without their own field: dry (TTS, close-talk) | recorded
+  recorded_live: skip     # live side of a recorded input: skip | passthrough
 
 scene:                    # `scenes`: full-duplex streams with labels
   duration_s: [10.0, 24.0]

@@ -2,40 +2,38 @@
 
 ``render_mic`` takes four files. Each one may be omitted:
 
-* ``speech`` — the user (A). A mouth, a talking level, a facing direction.
-* ``playback`` — audio rendered as an electronic device (B): programme chain,
-  loudspeaker, then the room. A and B may be TTS from the same batch, or the
-  same file.
-* ``noise`` — a noise recording at the microphone. Omitted, the scene uses its
+* ``speech`` - the user (A). A mouth, a talking level, a facing direction.
+* ``playback`` - audio rendered as an electronic device (B): one of the playback
+  forms (a produced programme, a recording from another room, or a recording made in
+  this room), a delivery chain, the loudspeaker, then the room. A and B may be TTS
+  from the same batch, or the same file. B may also be a real room recording
+  (``playback_origin="recorded"``), which is then played back as it is.
+* ``noise`` - a noise recording at the microphone. Omitted, the scene uses its
   synthetic ambience, scaled to the scene's A-weighted level either way.
-* ``rir`` — one measured room impulse response, shared by every source.
-  Omitted, the geometric room is used. A measured IR's own gain is discarded
-  and its direct path is scaled to the source distance, as with ``room.measured``.
+* ``rir`` - one measured room impulse response, shared by every source. Omitted, the
+  geometric room is used. The measured IR supplies the room's late reverberation;
+  direct sound and early reflections still follow each source's position and
+  directivity (``room.measured_mode``).
 
-Both sources start together and overlap; the longer one continues alone. The
-return value is what the scene's microphone records, after the shared capture
-chain.
+Both sources start together and overlap; the longer one continues alone. The return
+value is what the scene's microphone records, after the shared capture chain.
 
-``main`` reads one optional path list for each of those four inputs and writes
-one mix per line. Lists are aligned by line and shorter lists cycle. The list
-format is the same as everywhere else: one path per line, optional text and
-speaker on the speech and playback lists.
+``main`` reads one optional path list for each of those four inputs and writes one
+mix per line. Lists are aligned by line and shorter lists cycle. The list format is
+the same as everywhere else: one path per line, optional text and speaker on the
+speech and playback lists, and per-line ``origin`` / ``playback`` fields in JSONL.
 """
 
 from __future__ import annotations
 
-import json
-import sys
 from collections import OrderedDict
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-import yaml
 
-from .config import Config
+from .config import Config, parse_forms
 from .dsp import (
     a_weight,
     fade_edges,
@@ -47,6 +45,7 @@ from .dsp import (
     to_mono,
 )
 from .irbank import IR_SUFFIXES, IRBank
+from .jobs import run_jobs, save_config
 from .noise import scale_to_dba
 from .pathlist import read_path_list, read_utterances
 from .scene import SceneRenderer, derive_seed, spl_dba, stream_rng
@@ -75,12 +74,16 @@ def render_mic(
     seed: int = 0,
     key: str = "mic",
     cache: dict | None = None,
+    playback_origin: str | None = None,
+    playback_forms=None,
 ) -> MicRender:
     """Record one environment at its microphone.
 
-    ``speech`` is the user and ``playback`` is rendered as a device. ``noise``
-    and ``rir`` replace the synthetic ambience and the geometric room when a
-    recording is available. Any argument may be ``None``.
+    ``speech`` is the user and ``playback`` is rendered as a device. ``noise`` and
+    ``rir`` replace the synthetic ambience and the geometric room when a recording is
+    available. Any of the four may be ``None``. ``playback_origin`` says whether the
+    playback file is dry speech or a room recording (default ``render.origin``), and
+    ``playback_forms`` overrides ``playback.forms`` for this mix.
     """
     if scenes is None:
         scenes = SceneRenderer(config or Config())
@@ -91,6 +94,7 @@ def render_mic(
     playback_path = _require_file(playback, "audio") if playback is not None else None
     noise_path = _require_file(noise, "noise") if noise is not None else None
     rir_path = _checked_rir(rir) if rir is not None else None
+    origin, forms = _playback_spec(playback_origin or config.render.origin, playback_forms)
 
     scene = scenes.sample_scene(int(seed), key)
     if rir_path is not None:
@@ -109,39 +113,21 @@ def render_mic(
     sources: dict[str, dict] = {}
     segments: list[dict] = []
     if dry_user is not None:
-        _add_source(
-            mix,
-            segments,
-            sources,
-            scenes.render_talker(scene, dry_user),
-            dry_user,
-            sr,
-            n,
-            "live",
-            "live0",
-        )
+        source = scenes.render_talker(scene, dry_user)
+        _add_source(mix, segments, sources, source, dry_user, sr, n, "live", "live0")
     if dry_device is not None:
-        _add_source(
-            mix,
-            segments,
-            sources,
-            scenes.render_device(scene, dry_device),
-            dry_device,
-            sr,
-            n,
-            "device",
-            "device0",
-        )
+        if origin == "recorded":
+            form = "rerecorded"
+            source = scenes.render_device(scene, None, form=form, recorded=dry_device)
+        else:
+            form = scenes.draw_form(scene, 0, forms)
+            source = scenes.render_device(scene, dry_device, form=form)
+        _add_source(mix, segments, sources, source, dry_device, sr, n, "device", "device0")
+        for segment in segments:
+            if segment["source"] == "device0":
+                segment["playback_form"] = form
 
-    if noise_path is not None:
-        bed = _cached_audio(noise_path, sr, cache, "noise")
-        noise_pa = _slice_noise(bed, n, sr, scene.noise_dba, stream_rng(scene.seed, "noise", 1))
-        noise_label = noise_path.name
-    elif config.noise.enabled:
-        noise_pa, noise_label = scenes.ambient(scene, n)
-    else:
-        noise_pa, noise_label = np.zeros(n), "none"
-
+    noise_pa, noise_label = _background(scenes, scene, noise_path, n, cache)
     audio, capture_meta = scenes.capture(scene, mix + noise_pa)
     duration = len(audio) / config.output.sr
     for segment in segments:
@@ -176,13 +162,15 @@ def main(
     config: Config | None = None,
     count: int | None = None,
     workers: int = 1,
+    playback_origin: str | None = None,
 ) -> int:
     """Render one mix per line of the four lists. Every list may be omitted.
 
-    Line ``i`` takes entry ``i % length`` from each list that was given, so a
-    short noise or RIR list repeats and the same list may be passed as both the
-    user speech and the playback audio. ``count`` overrides the number of mixes;
-    without it, the longest list sets the count.
+    Line ``i`` takes entry ``i % length`` from each list that was given, so a short
+    noise or RIR list repeats and the same list may be passed as both the user speech
+    and the playback audio. ``count`` overrides the number of mixes; without it, the
+    longest list sets the count. ``playback_origin`` is the origin of playback lines
+    that do not name one (default ``render.origin``); the user speech is always dry.
     """
     if workers < 1:
         raise ValueError(f"workers must be at least 1, got {workers}")
@@ -193,14 +181,20 @@ def main(
 
     speeches = read_utterances(speech_list, suffixes=AUDIO_SUFFIXES) if speech_list else []
     playbacks = read_utterances(playback_list, suffixes=AUDIO_SUFFIXES) if playback_list else []
-    noises = (
-        read_path_list(noise_list, kind="noise", suffixes=AUDIO_SUFFIXES) if noise_list else []
-    )
+    noises = read_path_list(noise_list, kind="noise", suffixes=AUDIO_SUFFIXES) if noise_list else []
     rirs = (
         read_path_list(rir_list, kind="impulse response", suffixes=IR_SUFFIXES) if rir_list else []
     )
-    n_mixes = count if count is not None else max(
-        (len(speeches), len(playbacks), len(noises), len(rirs)), default=0
+    for utt in speeches:
+        if utt.origin == "recorded":
+            raise ValueError(
+                f"{utt.key}: the user speech is rendered as a live talker, so it must be dry "
+                "speech, not a room recording"
+            )
+    n_mixes = (
+        count
+        if count is not None
+        else max((len(speeches), len(playbacks), len(noises), len(rirs)), default=0)
     )
     if n_mixes == 0:
         raise ValueError(
@@ -209,7 +203,7 @@ def main(
 
     out_root = Path(output)
     out_root.mkdir(parents=True, exist_ok=True)
-    _save_config(config, out_root)
+    save_config(config, out_root)
     suffix = config.output.suffix
     jobs = []
     for index in range(n_mixes):
@@ -229,6 +223,8 @@ def main(
                 rel,
                 name,
                 derive_seed(config.seed, "mix", index),
+                (played.origin or playback_origin) if played else None,
+                played.playback if played else None,
                 {
                     "text": None if speech is None else speech.text,
                     "speaker": None if speech is None else speech.speaker,
@@ -242,9 +238,30 @@ def main(
         f"noise {len(noises)}  rir {len(rirs)}"
     )
     manifest = out_root / "manifest.jsonl"
-    written, failed = _run_jobs(jobs, config, workers, manifest)
+    written, failed = run_jobs(
+        jobs, _mix_job, _init_worker, (config.to_dict(),), workers, manifest, lambda j: j[6]
+    )
     print(f"wrote {written} files, {failed} failed\nmanifest: {manifest}")
     return 1 if failed and not written else 0
+
+
+def _playback_spec(origin: str, playback_forms) -> tuple[str, dict | None]:
+    forms = parse_forms(playback_forms, "playback") if playback_forms is not None else None
+    if origin == "recorded" and forms and {n for n, w in forms.items() if w > 0} != {"rerecorded"}:
+        raise ValueError("recorded playback material can only be played in the 'rerecorded' form")
+    return origin, forms
+
+
+def _background(scenes: SceneRenderer, scene, noise_path: Path | None, n: int, cache: dict):
+    """The scene's noise at the microphone: a given recording at the scene's level, the
+    synthetic ambience, or nothing."""
+    if noise_path is not None:
+        bed = _cached_audio(noise_path, scenes.sr, cache, "noise")
+        noise = _slice_noise(bed, n, scenes.sr, scene.noise_dba, stream_rng(scene.seed, "noise", 1))
+        return noise, noise_path.name
+    if scenes.config.noise.enabled:
+        return scenes.ambient(scene, n)
+    return np.zeros(n), "none"
 
 
 def _add_source(mix, segments, sources, source, dry, sr, n, role, name) -> None:
@@ -340,18 +357,13 @@ def _at(items, index: int):
     return items[index % len(items)]
 
 
-def _save_config(config: Config, out_root: Path) -> None:
-    text = yaml.safe_dump(config.to_dict(), allow_unicode=True, sort_keys=False)
-    (out_root / "config.yaml").write_text(text, encoding="utf-8")
-
-
 def _init_worker(config_dict: dict) -> None:
     _STATE["scenes"] = SceneRenderer(Config.from_dict(config_dict))
     _STATE["cache"] = {}
 
 
-def _mix_job(job: tuple) -> dict:
-    speech, playback, noise, rir, target, rel, key, seed, extra = job
+def _mix_job(job: tuple) -> list[dict]:
+    speech, playback, noise, rir, target, rel, key, seed, origin, forms, extra = job
     try:
         rendered = render_mic(
             speech,
@@ -362,49 +374,15 @@ def _mix_job(job: tuple) -> dict:
             seed=seed,
             key=key,
             cache=_STATE["cache"],
+            playback_origin=origin,
+            playback_forms=forms,
         )
         path = Path(target)
         path.parent.mkdir(parents=True, exist_ok=True)
         sf.write(path, rendered.audio, rendered.sr, subtype=_STATE["scenes"].config.output.subtype)
-        return {"audio": rel, **extra, **rendered.meta}
+        return [{"audio": rel, **extra, **rendered.meta}]
     except Exception as exc:  # noqa: BLE001 - one bad file should not stop the batch
-        return {"audio": rel, "job": key, "error": repr(exc), **extra}
-
-
-def _run_jobs(jobs, config: Config, workers: int, manifest_path: Path) -> tuple[int, int]:
-    written = failed = 0
-    total = len(jobs)
-
-    def record_all(records: list[dict], manifest) -> None:
-        nonlocal written, failed
-        for record in records:
-            manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
-            if "error" in record:
-                failed += 1
-                print(f"  FAILED {record.get('job')}: {record['error']}", file=sys.stderr)
-            else:
-                written += 1
-
-    with open(manifest_path, "w", encoding="utf-8") as manifest:
-        if workers == 1:
-            _init_worker(config.to_dict())
-            for done, job in enumerate(jobs, start=1):
-                record_all([_mix_job(job)], manifest)
-                if done % 10 == 0 or done == total:
-                    print(f"  {done}/{total}", end="\r", flush=True)
-        else:
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_worker,
-                initargs=(config.to_dict(),),
-            ) as pool:
-                futures = [pool.submit(_mix_job, job) for job in jobs]
-                for done, future in enumerate(as_completed(futures), start=1):
-                    record_all([future.result()], manifest)
-                    if done % 10 == 0 or done == total:
-                        print(f"  {done}/{total}", end="\r", flush=True)
-    print()
-    return written, failed
+        return [{"audio": rel, "job": key, "error": repr(exc), **extra}]
 
 
 __all__ = ["MicRender", "main", "render_mic"]

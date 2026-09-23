@@ -7,7 +7,14 @@ import pytest
 
 from replay_opus.config import Config, TalkerConfig
 from replay_opus.content import CONTENT_PROFILES, ContentChain, apply_content, sample_content
-from replay_opus.dsp import P_REF, a_weight, active_level_db, frame_energy, sos_response_db
+from replay_opus.dsp import (
+    P_REF,
+    a_weight,
+    frame_energy,
+    sos_response_db,
+    speech_level_db,
+    speech_level_from_energy,
+)
 from replay_opus.environment import (
     CAR_DEVICE_LAYOUTS,
     ENVIRONMENTS,
@@ -31,7 +38,7 @@ SR = 32_000
 
 
 def _spl(x: np.ndarray) -> float:
-    return active_level_db(x, SR) - 20 * np.log10(P_REF)
+    return speech_level_db(x, SR) - 20 * np.log10(P_REF)
 
 
 def _device(kind: str, env: str, rng, noise_dba: float = 40.0, content: str | None = None):
@@ -66,8 +73,7 @@ def test_device_output_is_calibrated_to_its_level(rng, speech):
     drivers, _ = device_emission(speech, SR, device)
     hop = int(0.02 * SR)
     energy = sum(frame_energy(a_weight(d, SR), hop) for d in drivers)
-    active = 10 * np.log10(energy + 1e-30) > 10 * np.log10(energy.max()) - 35
-    level = 10 * np.log10(np.mean(energy[active])) - 20 * np.log10(P_REF)
+    level = speech_level_from_energy(energy) - 20 * np.log10(P_REF)
     assert level == pytest.approx(device.level_dba, abs=0.05)
     assert len(drivers) == len(device.placement.poses) == 2
 

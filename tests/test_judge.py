@@ -109,6 +109,8 @@ def test_judge_reports_paired_statistics(rendered, monkeypatch):
     assert {"device>live", "replay>live", "live>dry", "device>dry"} == set(entry["auc"])
     paired = entry["paired"]["device>live"]
     assert paired["n"] == 3 and 0.0 <= paired["win_rate"] <= 1.0
+    assert sum(v["n"] for v in entry["by_playback_form"].values()) == 3
+    assert set(entry["by_playback_form"]) <= {"single", "rerecorded", "replay"}
     assert all(set(s) == set(judge.CONDITIONS) for s in entry["scores"].values())
     assert "same scene" in judge.format_judge_report(result)
 

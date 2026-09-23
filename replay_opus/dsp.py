@@ -206,6 +206,41 @@ def active_level_db(
     return float(10.0 * np.log10(np.mean(energy[active]) + EPS))
 
 
+def speech_level_from_energy(
+    energy: np.ndarray, floor_db: float = -35.0, margin_db: float = 15.9, iterations: int = 6
+) -> float:
+    """Active speech level (dB) of frame energies, in the manner of ITU-T P.56: the mean
+    energy of the frames that lie within ``margin_db`` of that mean.
+
+    The first estimate averages the frames within ``floor_db`` of the loudest; each
+    pass then keeps the frames above the current estimate minus the margin. Room tone
+    between words - a recording's own background, a music bed - falls below the margin
+    and stops pulling the level down, so a voice over a noise floor is set to the same
+    level as the same voice without one.
+    """
+    energy = np.asarray(energy, dtype=np.float64)
+    energy_db = 10.0 * np.log10(energy + EPS)
+    level = float(10.0 * np.log10(np.mean(energy[energy_db > energy_db.max() + floor_db]) + EPS))
+    for _ in range(iterations):
+        keep = energy_db > level - margin_db
+        if not np.any(keep):
+            break
+        new = float(10.0 * np.log10(np.mean(energy[keep]) + EPS))
+        if abs(new - level) < 0.01:
+            return new
+        level = new
+    return level
+
+
+def speech_level_db(
+    x: np.ndarray, sr: int, weighted: bool = True, frame_ms: float = 20.0
+) -> float:
+    """Active speech level of a signal, A-weighted by default (see
+    :func:`speech_level_from_energy`)."""
+    y = a_weight(x, sr) if weighted else np.asarray(x, dtype=np.float64)
+    return speech_level_from_energy(frame_energy(y, max(1, int(sr * frame_ms / 1000.0))))
+
+
 def speech_segments(
     x: np.ndarray,
     sr: int,

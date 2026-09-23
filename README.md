@@ -1,11 +1,14 @@
 # replay_opus
 
-把 TTS 合成的语音渲染成两类训练数据，用来训练全双工语音对话系统的**拒识**能力：
+把 TTS 语音或真人对着麦克风的录音，渲染成两类训练数据，用来训练全双工语音对话系统的**拒识**能力：
 
-- **真人（live）**：一个人在客厅、卧室、厨房或车里，对着设备说出这句话；
-- **外放（device）**：电视、音箱、手机、平板、笔记本、智能音箱、收音机或车机，把同一句话播放出来。
+- **真人（live，放行）**：一个人在客厅、卧室、厨房或车里，对着设备说出这句话；
+- **外放（device，拒识）**：电视、音箱、手机、平板、笔记本、智能音箱、收音机或车机，把同一句话播放出来。外放有三种形式，都标 `device`：
+  - **单次外放（`single`）**：制作好的节目播放一次，比如电视、电台、播客；
+  - **录音再外放（`rerecorded`）**：有人在别的房间用手机录下来再放，比如短视频、语音消息、免提通话；
+  - **同场景二次重放（`replay`）**：有人在这个房间里被手机录下，录音再在这里放出来。
 
-两类放在**同一个场景**里生成：同一个房间、同一组噪声、同一个麦克风、同一条采集链。它们之间唯一的区别是声音是怎么发出来的。
+两类放在**同一个场景**里生成：同一个房间、同一组噪声、同一个麦克风、同一条采集链。它们之间唯一的区别是声音是怎么来到麦克风的。设计依据、参数来源和文献汇总见 [`docs/tts-live-playback-rendering.md`](docs/tts-live-playback-rendering.md)。
 
 ![同一句 TTS 在同一场景里的真人版与外放版](demo/spectrograms.jpg)
 
@@ -23,24 +26,31 @@
 ## 架构
 
 ```text
-                ┌─ 真人：嗓音电平 · Lombard 效应 · 嘴部指向性 ───────────────────────────────┐
-TTS 语音 ──────┤                                                                           ├─→ 同一房间 ─→ 同一噪声 ─→ 同一采集链 ─→ 输出
-                └─ 外放：节目链（广播/流媒体/通话/电台）─→ 设备 DSP ─→ 扬声器非线性 ─→ 多单元频响 ┘
-                   （编解码、响度、压缩、配乐、原录音房间）   （对白 EQ、虚拟低音、AVL、智能功放限幅）
+                ┌─ 真人：嗓音电平 · Lombard 效应 · 嘴部指向性 ────────────────────────────────────────┐
+输入语音 ──────┤                                                                                    ├─→ 同一房间 ─→ 同一噪声 ─→ 同一采集链 ─→ 输出
+                └─ 外放：[形式] ─→ 节目链（广播/流媒体/通话/电台）─→ 设备 DSP ─→ 扬声器非线性 ─→ 多单元频响 ┘
+                         single：无                    （编解码、响度、压缩、配乐）  （对白 EQ、虚拟低音、AVL、智能功放限幅）
+                         rerecorded：远端房间 · 远端手机（降噪、AGC）
+                         replay：本地房间 · 附近手机 · 存储编码（不再经过节目链）
 ```
+
+输入分两种来源。**`dry`**（默认）是 TTS，或者近讲、安静条件下录的真人，当作嘴里发出的声音，两类都能生成。**`recorded`** 是已经在某个房间被某只麦克风录下的真人（手机录音、远场录音、众包录音），它只能变成 `rerecorded` 外放，录音本身就是远端那一段；它的真人版就是它自己。
+
+同一句话的三种外放形式从同一台设备、同一个位置放出来：设备、摆位和房间路径在抽形式之前就已经定好。
 
 **共享的部分**（`scene.py`、`acoustics.py`、`noise.py`、`capture.py`）：
 
 - **房间**：鞋盒模型。早期反射用镜像源法，每个镜像按倍频程计算墙面吸声、空气吸收（ISO 9613-1）和声源指向性；混合时间之后接扩散尾，尾部电平由同一房间按 Barron 修正理论算出。家具和座椅的散射用散射系数建模：每次反射把一部分镜面能量交给扩散场。所以同一场景里的真人和电视共享 RT60，但各自的直达声、早期反射和直混比取决于自己的位置和朝向。
 - **环境预设**（`environment.py`）：客厅、卧室、厨房、书房、车舱。每种预设给出房间尺寸、混响、麦克风位置、说话人位置、设备类型的比例和噪声工况。车舱有固定座位（主驾、副驾、后排）和车机扬声器布局（门板低音、A 柱高音、后门同轴，可选中置）。
 - **噪声**：以麦克风处的 A 计权声压级给出。家居有安静底噪、空调风扇、电器嗡声、窗外交通；车内有怠速、城市、高速三种工况，由胎噪、发动机阶次、风噪和鼓风机合成。同一场景的噪声对两类完全相同，逐样本一致。
-- **采集链**：MEMS 麦克风频响和自噪声、声压到数字满度的映射、前端高通、AGC、ADC 削波，以及可选的上行编解码。
+- **采集链**：MEMS 麦克风频响和自噪声、声压到数字满度的映射、前端高通、可选的降噪、AGC、ADC 削波，以及可选的上行编解码。
 
 **不同的部分**，也就是模型真正该学的东西：
 
 | | 真人（`talker.py`） | 外放（`content.py` + `speaker.py`） |
 | --- | --- | --- |
-| 电平 | 1 m 处 55–66 dB(A)，噪声大时按 Lombard 效应抬高并变亮 | 按设备听音音量设定，噪声大时用户会调大音量 |
+| 电平 | 1 m 处 55–66 dB(A)，噪声大时按 Lombard 效应抬高并变亮 | 按设备听音音量设定，噪声大时用户会调大音量。两边都按 P.56 式有效语音电平校准，句间的底噪和配乐不算在内 |
+| 喇叭之前 | 无 | `rerecorded`：远端房间、远端说话人、远端噪声、远端手机的采集链；`replay`：同一房间里另一个位置的说话人、附近手机、存储编码 |
 | 频带 | 无限制 | 小喇叭高通：手机 400–900 Hz、平板 250–550 Hz、笔记本 180–450 Hz、电视 90–220 Hz；外加谐振峰、腔体峰和箱体起伏 |
 | 节目处理 | 无 | 响度归一（-23/-24 LUFS 或 -12~-18 LUFS）、母带压缩、限幅、配乐、原录音房间 |
 | 编解码 | 无 | AAC / AC-3 / MP2（广播），AAC / Opus / MP3（流媒体），AMR-NB / G.711 / G.722 / Opus（通话） |
@@ -58,7 +68,7 @@ python -m venv .venv
 python -m replay_opus selftest
 ```
 
-`av`（PyAV）自带 ffmpeg，上面所有编解码器都**不需要**另装系统 ffmpeg。`selftest` 用答案已知的系统逐项验证：BS.1770 响度、A 计权、房间 RT60 与直混比、所有编解码器往返、扫频测量、成对渲染的共享性质、场景标签的位置。
+`av`（PyAV）自带 ffmpeg，上面所有编解码器都**不需要**另装系统 ffmpeg。`selftest` 用答案已知的系统逐项验证：BS.1770 响度、A 计权、房间 RT60 与直混比、所有编解码器往返、扫频测量、成对渲染的共享性质、三种外放形式共用同一台设备、场景标签的位置。
 
 ## 输入：一行一条语音
 
@@ -71,6 +81,19 @@ tts/zh_009.wav
 ```
 
 每行可以是 `路径`、`路径<TAB>文本` 或 `路径<TAB>说话人<TAB>文本`，也可以用 `.jsonl`，每行写 `{"audio": ..., "text": ..., "speaker": ...}`。相对路径相对于列表文件所在的目录。文本和说话人会原样写进标签。编码接受 UTF-8、带 BOM 的 UTF-8 和 UTF-16。
+
+JSONL 的每一行还可以说明这条输入是什么、要放成哪种外放：
+
+```json
+{"audio": "tts/zh_000.wav", "text": "打开客厅的灯"}
+{"audio": "tts/zh_001.wav", "text": "今天有雨", "playback": "replay"}
+{"audio": "rec/user_17.wav", "text": "帮我定个闹钟", "origin": "recorded"}
+{"audio": "tts/zh_002.wav", "playback": {"single": 1, "rerecorded": 2}}
+```
+
+- `origin`：`dry` 或 `recorded`。不写就用 `render.origin`，命令行 `--origin recorded` 可以把整份列表设成真人录音。
+- `playback`：一个形式名、一个列表或 `{形式: 权重}`。不写就按 `playback.forms` 抽（默认 `single` 0.5、`rerecorded` 0.3、`replay` 0.2），命令行 `--forms replay` 或 `--forms single=2,rerecorded=1,replay=1` 可以整体改。
+- `recorded` 输入只能放成 `rerecorded`；写了别的形式，`render` 在开始之前就会报出是哪一条。它的真人版默认不写（`render.recorded_live: skip`）；设成 `passthrough` 会把录音本身按外放版的有效语音电平写进 `live/`，但它和外放版不共享场景，使用前先看文档第 5 节。
 
 `demo/inputs.txt` 是 12 条真实 TTS（Windows 自带的 Huihui / Zira 语音，由 `scripts/make_demo_tts.ps1` 生成），其中既有助手指令也有新闻、剧集、广告式的句子。两类数据来自同一个语音池，所以句子内容本身不会决定标签。
 
@@ -95,11 +118,15 @@ manifest 的主要字段：
 | `label` | `live` 或 `device` |
 | `pair` | 成对 ID：`key#variant`，两类共用 |
 | `text` / `speaker` | 从输入列表带过来 |
+| `origin` | 输入来源：`dry` 或 `recorded` |
+| `playback_form` | 外放行才有：`single`、`rerecorded` 或 `replay`。只是元数据，训练标签仍然是 `label` |
 | `at_mic` | 麦克风处的语音 A 计权电平、信噪比、直达声延迟 |
 | `scene` | 环境、房间尺寸与分频带 RT60、麦克风位置、噪声工况与电平、采集链参数 |
-| `source` | 真人：电平、Lombard、朝向、距离；设备：类型、各单元位置与频响、DSP 设置、节目链（响度、压缩、编解码、配乐） |
+| `source` | 真人：电平、Lombard、朝向、距离、房间路径（含声学频谱起伏 `sstd_db`）；设备：类型、各单元位置与频响、DSP 设置、节目链（响度、压缩、编解码、配乐），以及 `playback`：形式、远端场景或偷录手机的全部参数、声学部分的频谱起伏 `acoustic_sstd_db` |
 
 `--mode` 可以是 `paired`（默认，两类都出）、`mixed`（每个 variant 按 `render.device_prob` 只出一类）、`live` 或 `device`。
+
+每个 variant 的外放形式按该条输入的 `playback` 或 `playback.forms` 抽取。要看同一场景下三种形式的差别，可以用 `--forms` 各渲染一遍：场景、设备和位置都相同，只有喇叭之前的那一段不同。
 
 吞吐：单进程成对模式约 18 倍实时。这台机器上 8 进程渲染 480 条（约 29 分钟音频）用时 19 秒，约 90 倍实时。
 
@@ -115,7 +142,7 @@ python -m replay_opus scenes --input demo/inputs.txt --output out/scenes --count
 
 manifest 每行一个场景，标签有两层，时间都是语音**到达麦克风**的时刻：
 
-- `utterances`：每条放进场景的语音一项，带角色、声源、设备、节目类型、文本和说话人；
+- `utterances`：每条放进场景的语音一项，带角色、声源、设备、节目类型、外放形式（`playback_form`）、文本和说话人；
 - `segments`：这些语音内部的语音活动段。一句 TTS 如果中间停顿较长，会分成几段，每段用 `utterance` 指回它所属的那一句，不重复文本。
 
 下面是 `demo/scenes` 里上图那个场景的实际输出（节选）：
@@ -136,7 +163,7 @@ manifest 每行一个场景，标签有两层，时间都是语音**到达麦克
  "sources": {"device0": {...}, "live0": {...}}, "scene": {...}}
 ```
 
-场景类型按权重抽取：`both` 0.5、`device_only` 0.25、`live_only` 0.2、`empty` 0.05，可以在 `scene.types` 里改。如果输入列表带了说话人，同一场景里用户的声音不会和节目里任何一个角色相同，但每个说话人在整个数据集里两种角色都会出现。`--stems` 会额外写出每个声源在麦克风处的分轨（按混音同样的增益，但在 AGC、削波和上行编解码之前）。要把 `segments` 转成帧级标签：
+场景类型按权重抽取：`both` 0.5、`device_only` 0.25、`live_only` 0.2、`empty` 0.05，可以在 `scene.types` 里改。每个设备声源各自抽一种外放形式。如果输入列表带了说话人，同一场景里用户的声音不会和节目里任何一个角色相同，但每个说话人在整个数据集里两种角色都会出现。`recorded` 输入永远不当用户说话，只进 `rerecorded` 形式的节目，按原样播放。`--stems` 会额外写出每个声源在麦克风处的分轨（按混音同样的增益，但在 AGC、削波和上行编解码之前）。要把 `segments` 转成帧级标签：
 
 ```python
 from replay_opus import frame_labels
@@ -151,11 +178,11 @@ labels = frame_labels(record["segments"], record["duration_s"], frame_s=0.02)
 | 输入 | 是什么 | 不给的时候 |
 | --- | --- | --- |
 | 用户语音 A（`speech`） | 真人。走嘴、说话电平和指向 | 这段里没有用户 |
-| 外放素材 B（`playback`） | 渲染成电子设备外放：节目链、扬声器，再进房间 | 这段里没有外放 |
+| 外放素材 B（`playback`） | 渲染成电子设备外放：按外放形式经过录音环节和节目链、扬声器，再进房间 | 这段里没有外放 |
 | 噪声音频（`noise`） | 麦克风处的环境噪声录音 | 用这个场景的合成噪声 |
-| 实录房间 RIR（`rir`） | 这一间房的脉冲响应，用户和各个扬声器单元共用 | 用鞋盒房间模型 |
+| 实录房间 RIR（`rir`） | 这一间房的脉冲响应，用户和各个扬声器单元共用它的混响尾 | 用鞋盒房间模型 |
 
-A 和 B 可以来自同一批 TTS，也可以是同一个文件。两条都从时刻 0 开始，在麦克风处叠在一起；较长的那条单独延续到结束。噪声文件会缩放到该场景抽到的 A 计权声压级。实测 RIR 的绝对增益不用，直达声按声源到麦克风的距离重定标。输出再经过和 `render` 相同的采集链。
+A 和 B 可以来自同一批 TTS，也可以是同一个文件。两条都从时刻 0 开始，在麦克风处叠在一起；较长的那条单独延续到结束。噪声文件会缩放到该场景抽到的 A 计权声压级。实测 RIR 只提供混响尾，直达声和早期反射仍按各个声源的位置和指向性计算（`room.measured_mode: hybrid`）。输出再经过和 `render` 相同的采集链。B 如果是真人录音，用 `--playback-origin recorded` 或 JSONL 里的 `origin`；A 总是真人，必须是 `dry`。`--forms` 同样适用于 B。
 
 ```python
 from replay_opus import render_mic
@@ -202,9 +229,9 @@ out/mix/config.yaml
 - **内容和音色**：两类来自同一个 TTS 语音池；成对模式下连句子都相同。
 - **房间、噪声、麦克风、前端**：同一场景共享，噪声逐样本一致。
 - **电平**：设备音量和人声电平的分布是按麦克风处的实际声压校准过的。车舱会额外带来约 7 dB 的混响增益，车机的电平已经把这一点算进去了。
-- **时长和起始静音**：成对的两个文件等长。
+- **时长和起始静音**：成对的两个文件等长，语音到达麦克风的时刻只差各自的传播距离；编解码器的预读延迟按互相关对齐掉。
 
-同时保留了难例：条形音箱和智能音箱近距离播放（难负例）、远处背对设备的用户、70 dB(A) 车噪下的用户（难正例）。
+同时保留了难例：条形音箱和智能音箱近距离播放（难负例）、远处背对设备的用户、70 dB(A) 车噪下的用户（难正例）、贴着手机录的短视频（录音再外放里最接近单次外放的一种）。
 
 `audit` 命令逐个特征检查有没有漏网的捷径。它计算每个简单特征单独区分两类的 AUC（0.5 表示没有信息）：
 
@@ -212,21 +239,25 @@ out/mix/config.yaml
 python -m replay_opus audit --manifest out/pairs/manifest.jsonl
 ```
 
-默认配置下 12 条语音 × 20 个场景（480 个文件）的实测结果：
+默认配置下 12 条语音 × 20 个场景（240 对、480 个文件，三种外放形式按默认比例）的实测结果：
 
 ```text
 feature             kind          AUC        live      device
-level_dbfs          nuisance    0.553     -33.740     -32.304
-peak_dbfs           nuisance    0.466     -14.669     -15.244
+level_dbfs          nuisance    0.569     -33.967     -32.126
+peak_dbfs           nuisance    0.487     -15.253     -15.450
 duration_s          nuisance    0.500       3.625       3.625
-noise_floor_dbfs    nuisance    0.510     -54.864     -52.953
-crest_db            acoustic    0.257      19.093      16.393
+noise_floor_dbfs    nuisance    0.552     -53.731     -49.502
+lead_s              nuisance    0.510       0.175       0.175
+crest_db            acoustic    0.262      18.994      16.235
 ...
-level AUC by environment: bedroom 0.56, car_cabin 0.56, kitchen 0.55, living_room 0.54, study 0.56
-paired level difference device - live: mean +1.0 dB, sd 4.8, 10-90% [-4.6, +7.9]
+level AUC by environment: bedroom 0.58, car_cabin 0.59, kitchen 0.54, living_room 0.56, study 0.60
+level AUC by playback form (vs all live): replay 0.63 (n=46), rerecorded 0.61 (n=73), single 0.52 (n=121)
+paired level difference device - live: mean +1.5 dB, sd 5.1, 10-90% [-4.1, +9.0] over 240 pairs
+acoustic spectral spread, median [10-90%] dB: device:replay 6.0 [5.2, 7.4],
+    device:rerecorded 7.2 [6.1, 7.8], device:single 5.2 [4.2, 5.6], live 5.0 [4.0, 5.5]
 ```
 
-电平、峰值、时长、底噪这几个「无关特征」都在 0.5 附近，每个环境内部也是。波峰因数偏低（AUC 0.26）是物理上应有的差异：节目压缩和功放限幅会压低峰值。简单的全局频带比几乎分不开两类，因为噪声、麦克风低频滚降和前端高通在两类上一视同仁地抹掉了低频。模型要学的线索比全局频带比细得多。改了预设之后要重新跑一次 `audit`；`scripts/plot_manifest.py` 可以把两类的电平、信噪比、距离分布叠起来画出来。
+电平、峰值、时长、底噪和语音起始时间这几个「无关特征」都在 0.5 ± 0.2 以内，每个环境内部也是。`rerecorded` 和 `replay` 的电平 AUC 略高，因为它们把录音时的底噪一起放了出来：麦克风处语音电平的配对差中位数只有 −0.3 到 +1.1 dB，底噪的配对差中位数则是 `rerecorded` +1.9 dB、`replay` +1.3 dB。这是物理上应有的差异，但大小取决于远端噪声的设定。波峰因数偏低（AUC 0.26）来自节目压缩和功放限幅。声学部分的频谱起伏（SSTD）和房间声学理论一致：一个房间约 5.6 dB，两个房间串联约 8 dB；几种外放形式的区间彼此覆盖，这也是它们共用一个标签的原因之一。改了预设之后要重新跑一次 `audit`；`scripts/plot_manifest.py` 可以把两类的电平、信噪比、距离分布叠起来画出来。
 
 ## 用第三方重放检测器验收
 
@@ -374,7 +405,19 @@ devices:
 content:
   profiles:
     streaming: {bed_prob: 0.8}                 # 流媒体更常带配乐
+playback:
+  forms: {single: 0.4, rerecorded: 0.4, replay: 0.2}   # 三种外放的比例，都标 device
+  rerecorded:
+    environments: {living_room: 0.5, bedroom: 0.5}     # 远端只在家里录，不在车里
+    distance_m: {default: [0.2, 1.0]}                  # 远端都是贴着手机录的
+    capture: {ns_prob: 0.9}                            # 远端手机几乎都开降噪
+  replay:
+    codecs: {amr_nb: 1.0}                              # 偷录的都存成 AMR
+capture:
+  ns_prob: 0.5                                 # 你的设备在模型前面跑了降噪
 ```
+
+`playback.rerecorded.capture` 和 `playback.replay.capture` 是另外两部手机的采集链，写在里面的值覆盖内置默认值，不继承顶层 `capture` 的修改。
 
 ```bash
 python -m replay_opus render --input in.txt --output out --config my.yaml --set capture.agc_prob=0
@@ -388,10 +431,12 @@ python -m replay_opus render --input in.txt --output out --config my.yaml --set 
 
 | 素材 | 配置项 | 说明 |
 | --- | --- | --- |
-| 环境噪声 | `noise.lists: {home: ..., car: ...}` | 家居、车内的真实底噪录音。电平仍按场景抽取 |
+| 真人干语音 | 输入列表，`origin: dry` | 近讲、安静条件下录的真人（EARS、VCTK、AISHELL-3 之类），和 TTS 放进同一个语音池，两类一起用 |
+| 真人房间录音 | 输入列表，`origin: recorded` | 手机或远场设备录的真人、Common Voice 之类的众包录音，直接当录音再外放的节目源 |
+| 环境噪声 | `noise.lists: {home: ..., car: ...}` | 家居、车内的真实底噪录音。电平仍按场景抽取；远端场景和偷录时刻也用它 |
 | 配乐 / 音效 | `content.bed_list` | 电视剧、短视频里的人声常压在音乐下面。可用 MUSAN music 之类的音乐库 |
-| 实测房间 IR | `room.measured: {living_room: ...}` | 每个子目录算一个房间；同一场景的真人和各个扬声器单元会从同一个房间的不同位置里抽 IR |
-| 麦克风频响 | `capture.mic_ir_list` | 你的目标设备或 POLIPHONE 之类的手机麦克风 IR |
+| 实测房间 IR | `room.measured: {living_room: ...}` | 每个子目录算一个房间；同一场景的各个声源从同一个房间的不同位置里抽 IR。默认只取它的混响尾（`room.measured_mode: hybrid`），因为它的直达声属于测量扬声器；`full` 整条使用 |
+| 麦克风频响 | `capture.mic_ir_list` | 你的目标设备或 POLIPHONE 之类的手机麦克风 IR；远端手机和偷录手机用 `playback.rerecorded.capture.mic_ir_list`、`playback.replay.capture.mic_ir_list` |
 | 实测设备频响 | `devices.measured: {tv: ...}` | 用 `sweep` / `extract` 在设备前 10–30 cm 测得，加载时自动截取前几毫秒以去掉测量房间 |
 
 测自己的电视或手机：
@@ -406,18 +451,20 @@ python -m replay_opus extract --recording rec.wav --output responses/ --name liv
 ## 验证
 
 - `python -m replay_opus selftest`：安装后的快速自检。
-- `python -m pytest tests -q`：121 项测试，检查的都是物理规律和两类之间的不变量，而不是快照（依赖 PyTorch 的两项在未安装时自动跳过）。主要包括：各倍频程 RT60 符合 Eyring 公式（误差在 12% 以内，实测约 5%），直混比随距离的变化符合扩散场理论（2 dB 以内），指向性只改变直达声不改变混响尾，设备输出电平校准到目标值（0.05 dB 以内），失真随音量增大，窄带通话 4.5 kHz 以上能量低于 -35 dB，成对渲染在语音到来之前逐样本一致，场景标签内外的能量差大于 10 dB，`configs/default.yaml` 与代码默认值一致。
+- `python -m pytest tests -q`：149 项测试，检查的都是物理规律和两类之间的不变量，而不是快照（依赖 PyTorch 的两项在未安装时自动跳过）。主要包括：各倍频程 RT60 符合 Eyring 公式（误差在 12% 以内，实测约 5%），直混比随距离的变化符合扩散场理论（2 dB 以内），指向性只改变直达声不改变混响尾，设备输出电平校准到目标值（0.05 dB 以内），失真随音量增大，窄带通话 4.5 kHz 以上能量低于 -35 dB，成对渲染在语音到来之前逐样本一致，场景标签内外的能量差大于 10 dB；三种外放形式都标 `device` 且共用同一台设备和同一个位置，`rerecorded` 经过另一个房间和另一部手机，`replay` 的偷录手机在同一个房间里、离说话人不超过设定距离，`recorded` 输入只出 `rerecorded` 外放；单个房间和两个房间串联的频谱起伏分别在 5.6 和 8 dB 附近，降噪器按设定量压低噪声而不动语音，底噪不改变有效语音电平，实测混响尾拼接后指向性和直混比仍随场景变化；`configs/default.yaml` 与代码默认值一致。
 - `python -m replay_opus judge`：用第三方重放检测器做同场景对照验收，见上一节。输入是 `render` 的 `manifest.jsonl`。
 - **下游验证只有一条路**：留一小份**真实录制**的评测集，在你目标的真实家庭和车里，分别录真人说话和真实电视、手机的外放。仿真训出的模型在这份集合上的表现，才是唯一能说明问题的指标。公开数据里，ReMASC 录了室内、户外和车内环境下的真人与重放语音，可以作为参照。
 
 ## 已知局限
 
 - **单通道。** 输出单个麦克风的信号。如果前端是麦克风阵列加波束形成，空间线索（声源方向稳定、多单元的空间扩展）只能部分体现。
-- **鞋盒近似。** 车舱和房间都按长方体计算，低频模态、桌面反射、座椅遮挡没有单独建模，只由散射系数和吸声分布近似。有实测房间 IR 时优先用实测。
+- **鞋盒近似。** 车舱和房间都按长方体计算，低频模态、桌面反射、座椅遮挡没有单独建模，只由散射系数和吸声分布近似。有实测或带家具的仿真房间 IR 时，用它们的混响尾。
 - **设备是参数模型。** 频响、失真、DSP 都按设备类型的典型范围随机抽取，指向性用心形族近似。要逼近某款具体产品，就测它的频响。
+- **远端噪声按环境预设取。** 录音类外放会把远端或偷录时的底噪一起放出来。如果你的真实外放素材底噪更低，调低远端环境里吵的工况，或者提高远端手机的降噪概率。
+- **没有多级外放。** 节目里再套一段外放（谈话节目连线的电话、翻拍电视的短视频）没有单独生成。
 - **没有建模回声。** 全双工系统自己播放的声音（AEC 残留）没有包含在内，那需要另外的数据。
 - **没有其他真人。** 家里其他人之间的对话同样是「真人」，从声学上无法拒识，需要语义或说话对象判断。
-- **只有 TTS 声音。** 模型在训练里没听过真人嗓音。如果有真实语音语料，建议把它加进同一个语音池，两类一起用。
+- **TTS 以外的真人嗓音要自己提供。** 模型只从 TTS 学，就没听过真实的声带。把近讲的真人语料按 `dry` 放进同一个语音池，两类一起用。
 - **Lombard 效应只建模了电平和频谱倾斜**，没有建模基频和语速的变化。
 
 ## 主要参考
@@ -428,6 +475,9 @@ python -m replay_opus extract --recording rec.wav --output responses/ --name liv
 - ISO 9613-1, *Attenuation of sound during propagation outdoors — Part 1: Calculation of the absorption of sound by the atmosphere*.
 - ITU-R BS.1770-4, *Algorithms to measure audio programme loudness and true-peak audio level*；EBU R 128；ATSC A/85.
 - ANSI S3.5-1997 / ISO 9921：不同发声力度下的语音声压级。
+- ITU-T P.56, *Objective measurement of active speech level*.
+- Y. Ephraim, D. Malah, *Speech enhancement using a minimum mean-square error short-time spectral amplitude estimator*, IEEE TASSP 32(6), 1984.
+- N. D. Gaubitch, D. Looney, *On the role of room acoustics in audio presentation attack detection*, ICASSP 2024.
 - H. Lane, B. Tranel, *The Lombard sign and the role of hearing in speech*, J. Speech Hear. Res. 14, 1971.
 - W. T. Chu, A. C. C. Warnock, *Detailed directivity of sound fields around human talkers*, NRC IRC-RR-104, 2002.
 - W. Klippel, *Tutorial: Loudspeaker nonlinearities — causes, parameters, symptoms*, JAES 54(10), 2006.

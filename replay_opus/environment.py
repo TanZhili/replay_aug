@@ -327,6 +327,26 @@ def place_talker(
     return Placement([Pose(p, _direction(yaw, _deg(rng, -10, 10)))], {"facing": facing})
 
 
+def place_recorder(
+    preset: dict, dims: np.ndarray, talker: Pose, distance_range, rng: np.random.Generator
+) -> tuple[np.ndarray, dict]:
+    """Where a phone recording a talker sits: held or on a table in front of the face
+    more often than beside or behind it, and a little below the mouth."""
+    margin = 0.05 if preset["layout"] == "car" else 0.15
+    lo, hi = float(distance_range[0]), float(distance_range[1])
+    facing = float(np.arctan2(talker.axis[1], talker.axis[0]))
+    for attempt in range(200):
+        if attempt and attempt % 50 == 0:
+            hi = max(lo, 0.7 * hi)
+        d = float(np.exp(rng.uniform(np.log(lo), np.log(max(hi, lo * 1.0001)))))
+        offset = rng.normal(0.0, np.deg2rad(45.0))
+        p = talker.position + d * _direction(facing + offset, _deg(rng, -40, 10))
+        if np.all(p >= margin) and np.all(p <= dims - margin):
+            return p, {"recorder_offset_deg": round(float(np.rad2deg(offset)), 1)}
+    p = _clamp(talker.position + lo * talker.axis, dims, margin)
+    return p, {"recorder_offset_deg": 0.0}
+
+
 # ---------------------------------------------------------------------------
 # Devices
 # ---------------------------------------------------------------------------
@@ -420,7 +440,7 @@ def _handheld(dims, mic, rng, height, n_drivers, spacing, pitch_deg):
 def _phone(dims, mic, rng):
     n = 1 if rng.random() < 0.45 else 2
     poses = _handheld(dims, mic, rng, (0.4, 1.3), n, rng.uniform(0.13, 0.16), (-20, 70))
-    return poses, {"drivers": n}
+    return poses, {"n_drivers": n}
 
 
 def _tablet(dims, mic, rng):
@@ -467,7 +487,7 @@ def _bluetooth_speaker(dims, mic, rng):
         Pose(_clamp(q, dims), axis)
         for q in _spread(p, _direction(yaw + np.pi / 2), rng.uniform(0.08, 0.18), n)
     ]
-    return poses, {"drivers": n}
+    return poses, {"n_drivers": n}
 
 
 def _radio(dims, mic, rng):
@@ -517,7 +537,7 @@ def _car_audio(dims, mic, rng):
                 _unit([0.3, 0.0, 1.0]),
             )
         )
-    return poses, {"centre_speaker": centre, "drivers": len(poses)}
+    return poses, {"centre_speaker": centre, "n_drivers": len(poses)}
 
 
 def _car_phone(dims, mic, rng):
@@ -538,7 +558,7 @@ def _car_phone(dims, mic, rng):
         Pose(_clamp(q, dims), axis)
         for q in _spread(p, _direction(yaw + np.pi / 2), rng.uniform(0.13, 0.16), n)
     ]
-    return poses, {"spot": spot, "drivers": n}
+    return poses, {"spot": spot, "n_drivers": n}
 
 
 ROOM_DEVICE_LAYOUTS = {
@@ -574,5 +594,6 @@ __all__ = [
     "build_room",
     "place_device",
     "place_mic",
+    "place_recorder",
     "place_talker",
 ]

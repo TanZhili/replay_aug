@@ -158,9 +158,7 @@ def test_main_aligns_optional_lists_and_cycles_the_short_ones(tmp_path):
     assert {s["role"] for s in records[0]["segments"]} == {"live"}
 
     same = tmp_path / "same"
-    assert (
-        main(speech_list, speech_list, output=same, config=_config(), workers=1) == 0
-    )
+    assert main(speech_list, speech_list, output=same, config=_config(), workers=1) == 0
     paired = [
         json.loads(line)
         for line in (same / "manifest.jsonl").read_text(encoding="utf-8").splitlines()

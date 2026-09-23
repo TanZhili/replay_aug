@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .acoustics import Directivity
-from .dsp import P_REF, active_level_db, apply_sos, sample_range, shelf_sos
+from .dsp import P_REF, apply_sos, sample_range, shelf_sos, speech_level_db
 from .environment import Placement
 
 # Cardioid-family fit to average talker directivity at 125 Hz ... 8 kHz.
@@ -68,7 +68,7 @@ def talker_emission(dry: np.ndarray, sr: int, talker: Talker) -> np.ndarray:
     """
     x = apply_sos(np.asarray(dry, dtype=np.float64), shelf_sos(sr, 1200.0, talker.tilt_db, "high"))
     want = 20.0 * np.log10(P_REF) + talker.level_dba
-    return x * 10.0 ** ((want - active_level_db(x, sr)) / 20.0)
+    return x * 10.0 ** ((want - speech_level_db(x, sr)) / 20.0)
 
 
 __all__ = ["MOUTH_DIRECTIVITY", "Talker", "sample_talker", "talker_emission"]
