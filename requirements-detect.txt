@@ -1,0 +1,6 @@
+# Optional: third-party replay detectors for `python -m replay_opus judge`.
+# CPU wheels are enough; on Linux/Windows without CUDA use:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.2
+transformers>=4.40
+huggingface_hub>=0.23

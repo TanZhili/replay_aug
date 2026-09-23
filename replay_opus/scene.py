@@ -209,8 +209,20 @@ class SceneRenderer:
         )
 
     def render_device(
-        self, scene: Scene, program: np.ndarray, index: int = 0, kind: str | None = None
+        self,
+        scene: Scene,
+        program: np.ndarray,
+        index: int = 0,
+        kind: str | None = None,
+        raw_programme: bool = False,
     ) -> SourceRender:
+        """Play ``program`` through a device of the scene.
+
+        ``raw_programme`` skips the broadcast / streaming / call chain and plays the
+        signal as it is - a recording replayed straight from a phone. The device and its
+        placement are drawn exactly as they would be otherwise, so the same ``index``
+        gives the same loudspeaker in the same spot either way.
+        """
         rng = stream_rng(scene.seed, "device", index)
         kind = kind or choose(rng, scene.preset["devices"])
         preset = self.devices[kind]
@@ -230,11 +242,14 @@ class SceneRenderer:
             content_name,
             self.measured_responses[kind] if use_measured else None,
         )
-        crng = stream_rng(scene.seed, "content", index)
-        chain = sample_content(
-            content_name, self.contents[content_name], crng, self.codecs, bool(self.beds)
-        )
-        programme, content_meta = apply_content(program, self.sr, chain, crng, self.beds)
+        if raw_programme:
+            programme, content_meta = program, {"content": "raw"}
+        else:
+            crng = stream_rng(scene.seed, "content", index)
+            chain = sample_content(
+                content_name, self.contents[content_name], crng, self.codecs, bool(self.beds)
+            )
+            programme, content_meta = apply_content(program, self.sr, chain, crng, self.beds)
         drivers, dsp_meta = device_emission(programme, self.sr, device)
 
         total = np.zeros(0)

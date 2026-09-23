@@ -14,6 +14,7 @@ import soundfile as sf
 import yaml
 
 from .config import Config
+from .detectors import DETECTORS
 from .irbank import IRBank, filter_ir_stats
 from .measure import SweepSpec, measure_chain, sweep_with_padding
 from .metrics import describe_ir
@@ -41,6 +42,12 @@ def _apply_set(data: dict, assignment: str) -> None:
             node[part] = {} if node.get(part) is None else node[part]
         node = node[part]
     node[parts[-1]] = yaml.safe_load(raw)
+
+
+def save_config(config: Config, out_root: Path) -> None:
+    """Keep the effective config with the outputs: scenes can be rebuilt from it."""
+    text = yaml.safe_dump(config.to_dict(), allow_unicode=True, sort_keys=False)
+    (out_root / "config.yaml").write_text(text, encoding="utf-8")
 
 
 def load_config(args: argparse.Namespace) -> Config:
@@ -192,6 +199,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     _WORKER.clear()
     out_root = Path(args.output)
     out_root.mkdir(parents=True, exist_ok=True)
+    save_config(config, out_root)
     n_variants = config.variants_per_file
     jobs = [
         (str(u.path), u.key, u.text, u.speaker, v, str(out_root), n_variants)
@@ -225,6 +233,7 @@ def cmd_scenes(args: argparse.Namespace) -> int:
     _WORKER.clear()
     out_root = Path(args.output)
     out_root.mkdir(parents=True, exist_ok=True)
+    save_config(config, out_root)
     jobs = [(i, str(out_root)) for i in range(args.start, args.start + args.count)]
     print(f"{args.count} scenes from {len(utterances)} utterances")
     manifest = out_root / "manifest.jsonl"
@@ -247,6 +256,37 @@ def cmd_audit(args: argparse.Namespace) -> int:
     if args.output:
         Path(args.output).write_text(
             json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"wrote {args.output}")
+    return 0
+
+
+def cmd_judge(args: argparse.Namespace) -> int:
+    from .judge import format_judge_report, run_judge  # noqa: PLC0415 - pulls in torch
+
+    def progress(stage: str, done: int, total: int) -> None:
+        if done % 10 == 0 or done == total:
+            print(f"  {stage} {done}/{total}      ", end="\r", flush=True)
+
+    try:
+        result = run_judge(
+            args.manifest,
+            args.detector,
+            limit=args.limit,
+            controls=not args.no_controls,
+            reference=args.reference,
+            config_path=args.config,
+            level_dbfs=args.level,
+            progress=progress,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print()
+    print(format_judge_report(result))
+    if args.output:
+        Path(args.output).write_text(
+            json.dumps(result, indent=1, ensure_ascii=False), encoding="utf-8"
         )
         print(f"wrote {args.output}")
     return 0
@@ -396,6 +436,29 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one flat list 
     audit.add_argument("--limit", type=int, help="audit only the first N clips")
     audit.add_argument("--output", help="write the full result as JSON")
     audit.set_defaults(func=cmd_audit)
+
+    judge = sub.add_parser("judge", help="score a render output with third-party replay detectors")
+    judge.add_argument("--manifest", required=True, help="manifest.jsonl written by render")
+    judge.add_argument(
+        "--detector",
+        action="append",
+        choices=sorted(DETECTORS),
+        help="detector to run (repeatable); all of them by default",
+    )
+    judge.add_argument("--limit", type=int, help="judge only the first N pairs")
+    judge.add_argument(
+        "--no-controls", action="store_true", help="skip the dry and replay controls"
+    )
+    judge.add_argument("--reference", help="your own recordings: path<TAB>bonafide|spoof per line")
+    judge.add_argument("--config", help="config used to render; default <render dir>/config.yaml")
+    judge.add_argument(
+        "--level",
+        type=float,
+        default=-26.0,
+        help="active level (dBFS) clips are set to before scoring",
+    )
+    judge.add_argument("--output", help="write per-clip scores and the summary as JSON")
+    judge.set_defaults(func=cmd_judge)
 
     presets = sub.add_parser(
         "presets", help="print the effective environment / device / content presets"

@@ -177,6 +177,82 @@ paired level difference device - live: mean +1.0 dB, sd 4.8, 10-90% [-4.6, +7.9]
 
 电平、峰值、时长、底噪这几个「无关特征」都在 0.5 附近，每个环境内部也是。波峰因数偏低（AUC 0.26）是物理上应有的差异：节目压缩和功放限幅会压低峰值。简单的全局频带比几乎分不开两类，因为噪声、麦克风低频滚降和前端高通在两类上一视同仁地抹掉了低频。模型要学的线索比全局频带比细得多。改了预设之后要重新跑一次 `audit`；`scripts/plot_manifest.py` 可以把两类的电平、信噪比、距离分布叠起来画出来。
 
+## 用第三方重放检测器验收
+
+`judge` 命令用独立训练的开源重放检测器给生成结果打分，回答「外放版到底像不像外放重录」。
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # 只需 CPU
+pip install -r requirements-detect.txt
+python -m replay_opus judge --manifest out/pairs/manifest.jsonl
+```
+
+权重在第一次运行时下载到 `~/.cache/replay_opus/detectors`，可以用环境变量 `REPLAY_OPUS_CACHE` 改位置。
+
+### 调研结论：重放检测没有真正意义上的开源 SOTA
+
+截至 2026 年 9 月，情况如下：
+
+- **真实重放录音上的最好成绩都没有公开权重。** 在 ASVspoof 2021 PA（真实房间、真实设备录制）评测集上，已发表的最好 EER 约 22–28%：压缩辅助特征约 22.7%，用 RIRplay 训练（TIFS 2026）28.04%。两者都只公开了论文或数据。
+- **能下载到权重的重放检测器只有两类。** 一类是 ASVspoof 2021 官方基线 LFCC-LCNN 和 JHU ASSERT 这类用 2019 PA **仿真**数据训练的模型，其中官方 LFCC-LCNN 在真实评测集上的 EER 是 44.77%，接近随机；另一类是社区上传的 wav2vec2-base，在 ASVspoof 2021 PA **真实录音**上微调，自报准确率 92.8%，但数据划分方式没有公开。
+- **EchoFake（ICASSP 2026）和 ReplayDF（Interspeech 2025）只公开了数据和训练代码。** ReMASC（有车内环境）只有多通道训练代码，都没有权重。
+- **W2V2-AASIST、XLS-R-SLS、AntiDeepfake 这些排行榜上的 SOTA 是深伪检测**（合成语音 vs 真人），不是重放检测。我们的两类都是 TTS，这些模型用不上。
+
+所以 `judge` 接入了能拿到的两个重放检测器：
+
+| 名称 | 模型 | 训练数据 |
+| --- | --- | --- |
+| `asvspoof21-pa-lcnn` | ASVspoof 2021 官方 PA 基线 LFCC-LCNN | ASVspoof 2019 PA（仿真重放） |
+| `w2v2-pa21` | wav2vec2-base 分类器（`Vansh180/deepfake-audio-wav2vec2`，固定版本） | ASVspoof 2021 PA（真实重放） |
+
+官方基线的原始代码依赖 2021 年的 PyTorch 接口（`torch.rfft` 和旧版 `torch.stft`），这里按原结构重写并加载官方权重，逐样本和原始实现对比，差异小于 1e-6。
+
+### 这些检测器学的不是「嘴 vs 喇叭」
+
+ASVspoof PA 里的 bona fide 本身就是一只高保真扬声器在房间里播放一次；spoof 是「被攻击者在另一个位置录下来，再用另一台设备放一次」，也就是经过两次声学传播。所以这些检测器学到的是**第二遍录音**留下的痕迹，而电视播演播室节目只经过一次喇叭和一次房间。
+
+因此单看分数没有意义。`judge` 会重建每一对样本所在的场景，在同一个场景里比较四个条件：
+
+| 条件 | 内容 |
+| --- | --- |
+| `dry` | 原始 TTS，没有房间 |
+| `live` | 渲染出的真人版 |
+| `device` | 渲染出的外放版 |
+| `replay` | 阳性对照：把真人版在同一个麦克风处录下来，再用同一台设备、在同一个位置放一遍，也就是 ASVspoof 定义的重放攻击 |
+
+报告里最关键的是同场景配对胜率：同一个场景里，外放版的分数比真人版更「像重放」的比例。
+
+### 实测结果
+
+用 `demo/inputs.txt` 的 12 条语音，每条渲染 20 个场景，共 240 对（`render --variants 20`，默认配置和种子）：
+
+| | 官方 LFCC-LCNN（仿真训练） | wav2vec2（真实录音训练） |
+| --- | --- | --- |
+| 阳性对照：replay 比 live 更像重放 | 88%（95% CI 83–91%），AUC 0.78 | 79%（73–84%），AUC 0.70 |
+| **外放版比真人版更像重放** | **72%（66–77%），AUC 0.66** | **65%（58–70%），AUC 0.61** |
+| 外放 − 真人的中位分差，对照 replay − 真人 | +0.67，对照 +1.77 | +0.18，对照 +0.54 |
+| 真人版比干净 TTS 更像重放（live>dry AUC） | 0.00（干净 TTS 被判成极像重放） | 0.98（带混响和噪声就更像重放） |
+
+按设备看外放胜率：官方 LCNN 下笔记本、平板 81%，蓝牙音箱 80%，智能音箱 79%，手机 78%，电视 66%，条形音箱 57%，车机 56%；wav2vec2 下条形音箱 86%，电视 80%，智能音箱 79%，车机 55%，手机 57%。按环境看，两个检测器都是车舱最低（60% / 56%）。
+
+怎么读这些数：
+
+1. **两个检测器都通过了阳性对照**：它们在我们的场景里能认出真正的二次重放，所以它们对外放版的判断有参考价值。
+2. **两个独立训练的检测器，包括在真实重放录音上训练的那个，都在同一场景里把外放版判得比真人版更像重放，而且显著高于随机**：置信区间都不含 50%。
+3. **幅度只有真正二次重放的约三分之一到五分之二。** 物理上本该如此，因为外放只经过一次传播。不要为了让这些检测器打高分，把外放数据往「二次录音」的方向调：那会把数据带偏到 ASVspoof 的伪影上，而不是更像真实的电视和手机外放。
+4. **车机最难分。** 全频多单元、座舱混响短、噪声大，而且 ASVspoof 的训练数据里没有车舱。这部分最需要真实车内录音来验证。
+5. **干净 TTS 那一行说明了为什么不能直接拿原始 TTS 当真人类。** 官方 LCNN 把干净 TTS 判成极像重放；wav2vec2 则把一切带混响和噪声的音频都判得更像重放。两类放进同一个场景后，这两种偏差都被抵消了。
+
+### 这个验收的分量有多重
+
+有限。两个检测器本身在真实重放上的表现一般，学的也是另一种「重放」。要得到确凿的结论只有一条路：准备一份**真实录制**的对照集，用 `--reference` 一起打分：
+
+```bash
+python -m replay_opus judge --manifest out/pairs/manifest.jsonl --reference real.txt
+```
+
+`real.txt` 每行是 `路径<TAB>bonafide` 或 `路径<TAB>spoof`。报告会给出每个检测器在这份真实数据上的 AUC；如果某个检测器在你的真实数据上本身就分不开两类，它对仿真数据的判断也就不作数。真实数据可以自己录，一两百条就够，也可以申请 ASVspoof 2019 real PA（需签协议）或 ReMASC（含车内）。有了真实数据以后，更可靠的「法官」是在真实数据上训一个轻量探针（冻结的自监督特征加线性分类器），CPU 上就能完成。
+
 ## 配置
 
 `configs/default.yaml` 就是全部内置默认值，每一项都有注释。环境、设备、节目链这三张预设表写在代码里，用下面的命令打印当前生效的版本：
@@ -229,7 +305,8 @@ python -m replay_opus extract --recording rec.wav --output responses/ --name liv
 ## 验证
 
 - `python -m replay_opus selftest`：安装后的快速自检。
-- `python -m pytest tests -q`：101 项测试，检查的都是物理规律和两类之间的不变量，而不是快照。主要包括：各倍频程 RT60 符合 Eyring 公式（误差在 12% 以内，实测约 5%），直混比随距离的变化符合扩散场理论（2 dB 以内），指向性只改变直达声不改变混响尾，设备输出电平校准到目标值（0.05 dB 以内），失真随音量增大，窄带通话 4.5 kHz 以上能量低于 -35 dB，成对渲染在语音到来之前逐样本一致，场景标签内外的能量差大于 10 dB，`configs/default.yaml` 与代码默认值一致。
+- `python -m pytest tests -q`：112 项测试，检查的都是物理规律和两类之间的不变量，而不是快照（依赖 PyTorch 的两项在未安装时自动跳过）。主要包括：各倍频程 RT60 符合 Eyring 公式（误差在 12% 以内，实测约 5%），直混比随距离的变化符合扩散场理论（2 dB 以内），指向性只改变直达声不改变混响尾，设备输出电平校准到目标值（0.05 dB 以内），失真随音量增大，窄带通话 4.5 kHz 以上能量低于 -35 dB，成对渲染在语音到来之前逐样本一致，场景标签内外的能量差大于 10 dB，`configs/default.yaml` 与代码默认值一致。
+- `python -m replay_opus judge`：用第三方重放检测器做同场景对照验收，见上一节。
 - **下游验证只有一条路**：留一小份**真实录制**的评测集，在你目标的真实家庭和车里，分别录真人说话和真实电视、手机的外放。仿真训出的模型在这份集合上的表现，才是唯一能说明问题的指标。公开数据里，ReMASC 录了室内、户外和车内环境下的真人与重放语音，可以作为参照。
 
 ## 已知局限
@@ -257,3 +334,7 @@ python -m replay_opus extract --recording rec.wav --output responses/ --name liv
 - A. Novak, P. Lotton, L. Simon, *Synchronized Swept-Sine: Theory, Application and Implementation*, JAES 63(10), 2015.
 - M. E. Ahmed et al., *Void: A fast and light voice liveness detection system*, USENIX Security 2020.
 - Y. Gong et al., *ReMASC: Realistic Replay Attack Corpus for Voice Controlled Systems*, Interspeech 2019.
+- J. Yamagishi et al., *ASVspoof 2021: accelerating progress in spoofed and deepfake speech detection*, ASVspoof 2021 Workshop.（表 6：PA 基线在真实重放评测集上的 EER，LFCC-LCNN 44.77%）
+- J. C. Sanchez-Valera et al., *RIRplay: Generation of a Replay Stereo Corpus for Voice Biometrics Anti-Spoofing*, IEEE TIFS 21, 2026.
+- *EchoFake: A Replay-Aware Dataset for Practical Speech Deepfake Detection*, ICASSP 2026.
+- N. Müller et al., *Replay Attacks Against Audio Deepfake Detection*（ReplayDF）, Interspeech 2025.
