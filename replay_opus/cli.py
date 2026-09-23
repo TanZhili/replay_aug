@@ -11,124 +11,264 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+import yaml
 
-from .chain import ReplayChain, describe_config
 from .config import Config
 from .irbank import IRBank, filter_ir_stats
 from .measure import SweepSpec, measure_chain, sweep_with_padding
 from .metrics import describe_ir
-from .pathlist import read_path_list, relative_labels
-from .selftest import run_selftest
+from .pathlist import Utterance, read_utterances
 
 AUDIO_SUFFIXES = (".wav", ".flac", ".ogg", ".mp3", ".m4a", ".opus")
 
 _WORKER: dict[str, object] = {}
 
 
-def _init_worker(config_dict: dict) -> None:
-    _WORKER["chain"] = ReplayChain(Config.from_dict(config_dict))
+# ---------------------------------------------------------------------------
+# config handling
+# ---------------------------------------------------------------------------
 
 
-def _process_one(args: tuple[str, str, str, int]) -> dict:
-    in_path, out_path, key, variant = args
-    chain: ReplayChain = _WORKER["chain"]  # type: ignore[assignment]
-    audio, sr = sf.read(in_path, always_2d=False)
-    result = chain.process(np.asarray(audio, dtype=np.float64), sr, key, variant)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    sf.write(out_path, result.audio, result.sr, subtype=chain.config.output.subtype)
-    return {"input": in_path, "output": out_path, **result.meta}
+def _apply_set(data: dict, assignment: str) -> None:
+    """``a.b.c=value`` with the value parsed as YAML (numbers, lists, null...)."""
+    if "=" not in assignment:
+        raise ValueError(f"--set expects key=value, got {assignment!r}")
+    key, _, raw = assignment.partition("=")
+    parts = key.strip().split(".")
+    node = data
+    for part in parts[:-1]:
+        if not isinstance(node.get(part), dict):
+            node[part] = {} if node.get(part) is None else node[part]
+        node = node[part]
+    node[parts[-1]] = yaml.safe_load(raw)
 
 
-def _apply_simulate_overrides(config: Config, args: argparse.Namespace) -> None:
-    if args.seed is not None:
-        config.seed = args.seed
-    if args.variants is not None:
-        config.variants_per_file = args.variants
-    if args.room_ir_list:
-        config.room.ir_list = args.room_ir_list
-        config.room.mode = args.room_mode or "reshaped"
-    elif args.room_mode:
-        config.room.mode = args.room_mode
-    if args.noise_list:
-        config.noise.noise_list = args.noise_list
-    if args.mic_ir_list:
-        config.capture.mic_ir_list = args.mic_ir_list
-    if args.speaker_model_list:
-        config.playback.model_list = args.speaker_model_list
-
-
-def cmd_simulate(args: argparse.Namespace) -> int:
+def load_config(args: argparse.Namespace) -> Config:
     config = Config.load(args.config)
-    _apply_simulate_overrides(config, args)
+    if getattr(args, "set", None):
+        data = config.to_dict()
+        for assignment in args.set:
+            _apply_set(data, assignment)
+        config = Config.from_dict(data)
+    if getattr(args, "seed", None) is not None:
+        config.seed = args.seed
+    if getattr(args, "variants", None) is not None:
+        config.variants_per_file = args.variants
+    if getattr(args, "mode", None):
+        config.render.mode = args.mode
+    config.validate()
+    return config
 
+
+# ---------------------------------------------------------------------------
+# workers
+# ---------------------------------------------------------------------------
+
+
+def _init_render_worker(config_dict: dict) -> None:
+    from .render import UtteranceRenderer  # noqa: PLC0415 - keep CLI start-up light
+
+    _WORKER["renderer"] = UtteranceRenderer(Config.from_dict(config_dict))
+
+
+def _render_job(job: tuple[str, str, str | None, str | None, int, str, int]) -> list[dict]:
+    path, key, text, speaker, variant, out_root, n_variants = job
+    renderer = _WORKER["renderer"]
+    audio, sr = sf.read(path, always_2d=False)
+    clips = renderer.render(np.asarray(audio, dtype=np.float64), sr, key, variant)
+    stem = Path(key).with_suffix("").as_posix()
+    output = renderer.config.output
+    records = []
+    for clip in clips:
+        name = stem if n_variants == 1 else f"{stem}__v{variant}"
+        rel = f"{clip.label}/{name}{output.suffix}"
+        target = Path(out_root) / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(target, clip.audio, clip.sr, subtype=output.subtype)
+        records.append(
+            {
+                "audio": rel,
+                "input": path,
+                "pair": f"{key}#{variant}",
+                "text": text,
+                "speaker": speaker,
+                **clip.meta,
+            }
+        )
+    return records
+
+
+def _init_scene_worker(
+    config_dict: dict, utterances: list[tuple[str, str, str | None, str | None]]
+) -> None:
+    from .compose import SceneComposer  # noqa: PLC0415
+
+    utts = [Utterance(Path(p), k, t, s) for p, k, t, s in utterances]
+    _WORKER["composer"] = SceneComposer(Config.from_dict(config_dict), utts)
+
+
+def _scene_job(job: tuple[int, str]) -> list[dict]:
+    index, out_root = job
+    composer = _WORKER["composer"]
+    scene = composer.compose(index)
+    name = f"scene_{index:06d}"
+    output = composer.config.output
+    subtype = output.subtype
+    rel = f"scenes/{name}{output.suffix}"
+    target = Path(out_root) / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(target, scene.audio, scene.sr, subtype=subtype)
+    record = {"audio": rel, "scene_id": name, **scene.meta}
+    if scene.stems:
+        record["stems"] = {}
+        for stem_name, stem in scene.stems.items():
+            stem_rel = f"stems/{name}.{stem_name}{output.suffix}"
+            (Path(out_root) / stem_rel).parent.mkdir(parents=True, exist_ok=True)
+            sf.write(Path(out_root) / stem_rel, np.clip(stem, -1.0, 1.0), scene.sr, subtype=subtype)
+            record["stems"][stem_name] = stem_rel
+    return [record]
+
+
+def _run_jobs(
+    jobs, worker, initializer, initargs, workers: int, manifest_path: Path
+) -> tuple[int, int]:
+    written = failed = 0
+    total = len(jobs)
+
+    def record_all(records: list[dict], manifest) -> None:
+        nonlocal written, failed
+        for record in records:
+            manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if "error" in record:
+                failed += 1
+                print(
+                    f"  FAILED {record.get('input', record.get('job'))}: {record['error']}",
+                    file=sys.stderr,
+                )
+            else:
+                written += 1
+
+    with open(manifest_path, "w", encoding="utf-8") as manifest:
+        if workers == 1:
+            initializer(*initargs)
+            for done, job in enumerate(jobs, start=1):
+                try:
+                    records = worker(job)
+                except Exception as exc:  # noqa: BLE001 - keep going, report at the end
+                    records = [{"job": repr(job[:2]), "error": repr(exc)}]
+                record_all(records, manifest)
+                if done % 10 == 0 or done == total:
+                    print(f"  {done}/{total}", end="\r", flush=True)
+        else:
+            with ProcessPoolExecutor(
+                max_workers=workers, initializer=initializer, initargs=initargs
+            ) as pool:
+                futures = {pool.submit(worker, job): job for job in jobs}
+                for done, future in enumerate(as_completed(futures), start=1):
+                    try:
+                        records = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        records = [{"job": repr(futures[future][:2]), "error": repr(exc)}]
+                    record_all(records, manifest)
+                    if done % 10 == 0 or done == total:
+                        print(f"  {done}/{total}", end="\r", flush=True)
+    print()
+    return written, failed
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_render(args: argparse.Namespace) -> int:
     try:
-        files = read_path_list(args.input, kind="input audio", suffixes=AUDIO_SUFFIXES)
-        probe = ReplayChain(config)
+        config = load_config(args)
+        utterances = read_utterances(args.input, suffixes=AUDIO_SUFFIXES)
+        _init_render_worker(config.to_dict())  # fail fast on bad lists before forking
     except (FileNotFoundError, ValueError) as exc:
         print(exc, file=sys.stderr)
         return 1
-    labels = relative_labels(files)
+    _WORKER.clear()
     out_root = Path(args.output)
-
-    print(json.dumps(describe_config(probe), ensure_ascii=False))
-    print(f"{len(files)} input files x {config.variants_per_file} variants")
-
-    jobs = []
-    for path, label in zip(files, labels, strict=True):
-        stem = Path(label).with_suffix("").as_posix()
-        for variant in range(config.variants_per_file):
-            name = (
-                f"{stem}{config.output.suffix}"
-                if config.variants_per_file == 1
-                else f"{stem}__v{variant}{config.output.suffix}"
-            )
-            jobs.append((str(path), str(out_root / name), label, variant))
-
     out_root.mkdir(parents=True, exist_ok=True)
-    manifest_path = out_root / "manifest.jsonl"
-    written = failed = 0
-
-    with open(manifest_path, "w", encoding="utf-8") as manifest:
-        if args.workers == 1:
-            _init_worker(config.to_dict())
-            iterator = (_safe(_process_one, job) for job in jobs)
-            for record in iterator:
-                written, failed = _record(manifest, record, written, failed, len(jobs))
-        else:
-            with ProcessPoolExecutor(
-                max_workers=args.workers, initializer=_init_worker, initargs=(config.to_dict(),)
-            ) as pool:
-                futures = {pool.submit(_process_one, job): job for job in jobs}
-                for future in as_completed(futures):
-                    try:
-                        record = future.result()
-                    except Exception as exc:  # noqa: BLE001 - keep going, report at the end
-                        record = {"input": futures[future][0], "error": repr(exc)}
-                    written, failed = _record(manifest, record, written, failed, len(jobs))
-
-    print(f"\nwrote {written} files, {failed} failed")
-    print(f"manifest: {manifest_path}")
+    n_variants = config.variants_per_file
+    jobs = [
+        (str(u.path), u.key, u.text, u.speaker, v, str(out_root), n_variants)
+        for u in utterances
+        for v in range(n_variants)
+    ]
+    per_job = 2 if config.render.mode == "paired" else 1
+    print(
+        f"{len(utterances)} utterances x {n_variants} variants, mode {config.render.mode} "
+        f"-> {len(jobs) * per_job} files"
+    )
+    manifest = out_root / "manifest.jsonl"
+    written, failed = _run_jobs(
+        jobs, _render_job, _init_render_worker, (config.to_dict(),), args.workers, manifest
+    )
+    print(f"wrote {written} files, {failed} failed\nmanifest: {manifest}")
     return 1 if failed and not written else 0
 
 
-def _safe(func, job):
+def cmd_scenes(args: argparse.Namespace) -> int:
     try:
-        return func(job)
-    except Exception as exc:  # noqa: BLE001
-        return {"input": job[0], "error": repr(exc)}
+        config = load_config(args)
+        if args.stems:
+            config.scene.save_stems = True
+        utterances = read_utterances(args.input, suffixes=AUDIO_SUFFIXES)
+        packed = [(str(u.path), u.key, u.text, u.speaker) for u in utterances]
+        _init_scene_worker(config.to_dict(), packed)
+    except (FileNotFoundError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    _WORKER.clear()
+    out_root = Path(args.output)
+    out_root.mkdir(parents=True, exist_ok=True)
+    jobs = [(i, str(out_root)) for i in range(args.start, args.start + args.count)]
+    print(f"{args.count} scenes from {len(utterances)} utterances")
+    manifest = out_root / "manifest.jsonl"
+    written, failed = _run_jobs(
+        jobs, _scene_job, _init_scene_worker, (config.to_dict(), packed), args.workers, manifest
+    )
+    print(f"wrote {written} scenes, {failed} failed\nmanifest: {manifest}")
+    return 1 if failed and not written else 0
 
 
-def _record(manifest, record: dict, written: int, failed: int, total: int) -> tuple[int, int]:
-    manifest.write(json.dumps(record, ensure_ascii=False) + "\n")
-    if "error" in record:
-        failed += 1
-        print(f"  FAILED {record['input']}: {record['error']}", file=sys.stderr)
+def cmd_audit(args: argparse.Namespace) -> int:
+    from .audit import format_report, run_audit  # noqa: PLC0415
+
+    try:
+        result = run_audit(args.manifest, args.limit)
+    except (FileNotFoundError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print(format_report(result))
+    if args.output:
+        Path(args.output).write_text(
+            json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"wrote {args.output}")
+    return 0
+
+
+def cmd_presets(args: argparse.Namespace) -> int:
+    config = load_config(args)
+    tables = {
+        "environments": config.environment_table(),
+        "devices": config.device_table(),
+        "content": config.content_table(),
+    }
+    wanted = {args.section: tables[args.section]} if args.section else tables
+    text = yaml.safe_dump(
+        wanted, allow_unicode=True, sort_keys=False, default_flow_style=None, width=100
+    )
+    if args.output:
+        Path(args.output).write_text(text, encoding="utf-8")
+        print(f"wrote {args.output}")
     else:
-        written += 1
-    done = written + failed
-    if done % 25 == 0 or done == total:
-        print(f"  {done}/{total}", end="\r", flush=True)
-    return written, failed
+        print(text)
+    return 0
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
@@ -137,8 +277,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     sf.write(args.output, padded, spec.sr, subtype="PCM_24")
     print(f"wrote {args.output}  ({len(padded) / spec.sr:.1f}s @ {spec.sr} Hz, L={rate:.4f}s)")
     print(
-        "Play this file through the loudspeaker and record it with the microphone you "
-        "want to model, keeping both at a fixed gain. Then run 'measure extract'."
+        "Play it through the device you want to model and record it 10-30 cm in front of "
+        "the device with a flat microphone, at a fixed gain. Then run 'extract'."
     )
     print(f"Leading silence is {pad / spec.sr:.1f}s; keep it in the recording.")
     return 0
@@ -151,20 +291,29 @@ def cmd_extract(args: argparse.Namespace) -> int:
         recorded = recorded.mean(axis=1)
 
     spec = SweepSpec(f1=args.f1, f2=args.f2, duration=args.duration, sr=sr)
-    ir, model, info = measure_chain(recorded, spec, ir_ms=args.ir_ms)
+    ir, info = measure_chain(recorded, spec, ir_ms=args.ir_ms)
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     name = args.name or Path(args.recording).stem
     sf.write(out / f"{name}.wav", ir / (np.max(np.abs(ir)) + 1e-12) * 0.95, sr, subtype="PCM_24")
-    model.label = name
-    model.save(out / f"{name}.npz")
+    base = ir[: min(len(ir), 4096)]
+    np.savez(
+        out / f"{name}.npz",
+        g1=base / (np.max(np.abs(base)) + 1e-12),
+        sr=sr,
+        label=name,
+        harmonic_rolloff_db=info["harmonic_rolloff_db"],
+        thd=info["thd_at_sweep_level"],
+    )
 
     report = {"name": name, "sr": sr, **describe_ir(ir, sr), **info}
     (out / f"{name}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps({k: v for k, v in report.items() if k != "harmonic_profile"}, indent=2))
     print(f"harmonic levels (dB re fundamental): {info['harmonic_profile']['level_db']}")
-    print(f"\nwrote {out / name}.wav (room IR), .npz (speaker model), .json (report)")
+    print(
+        f"\nwrote {out / name}.wav (impulse response), .npz (for devices.measured), .json (report)"
+    )
     return 0
 
 
@@ -193,45 +342,70 @@ def cmd_ir_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:
+    from .selftest import run_selftest  # noqa: PLC0415
+
     return run_selftest(Path(args.output) if args.output else None)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _add_config_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", help="YAML config; built-in defaults when omitted")
+    parser.add_argument("--seed", type=int, help="override the config seed")
+    parser.add_argument(
+        "--set",
+        action="append",
+        metavar="KEY=VALUE",
+        help="override any config value, e.g. --set capture.agc_prob=0 (repeatable)",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one flat list of options
     parser = argparse.ArgumentParser(
         prog="replay_opus",
-        description="Batch-convert clean/TTS audio into played-and-re-recorded audio.",
+        description="Render TTS speech as live talkers and as device playback in shared scenes.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    default_workers = max(1, (os.cpu_count() or 2) // 2)
 
-    sim = sub.add_parser("simulate", help="run the replay chain over a path list")
-    sim.add_argument(
-        "--input", required=True, help="text file listing source audio, one path per line"
+    render = sub.add_parser("render", help="per-utterance live / device clips (paired by default)")
+    render.add_argument(
+        "--input", required=True, help="utterance list: one path per line, optional text"
     )
-    sim.add_argument("--output", required=True, help="directory for generated audio")
-    sim.add_argument("--config", help="YAML config; defaults are used when omitted")
-    sim.add_argument("--seed", type=int, help="override config seed")
-    sim.add_argument("--variants", type=int, help="replay conditions per input file")
-    sim.add_argument(
-        "--room-ir-list",
-        help="text file listing room IRs; implies room mode 'reshaped'",
-    )
-    sim.add_argument(
-        "--noise-list",
-        help="text file listing noise recordings; overrides noise.noise_list",
-    )
-    sim.add_argument(
-        "--mic-ir-list",
-        help="text file listing microphone IRs; overrides capture.mic_ir_list",
-    )
-    sim.add_argument(
-        "--speaker-model-list",
-        help="text file listing measured speaker models (*.npz)",
-    )
-    sim.add_argument("--room-mode", choices=["measured", "reshaped", "synthetic", "simulated"])
-    sim.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
-    sim.set_defaults(func=cmd_simulate)
+    render.add_argument("--output", required=True, help="output directory")
+    render.add_argument("--variants", type=int, help="scenes per utterance")
+    render.add_argument("--mode", choices=["paired", "mixed", "live", "device"])
+    render.add_argument("--workers", type=int, default=default_workers)
+    _add_config_args(render)
+    render.set_defaults(func=cmd_render)
 
-    sweep = sub.add_parser("sweep", help="write the measurement sweep to play back")
+    scenes = sub.add_parser(
+        "scenes", help="full-duplex scenes with time-aligned live / device labels"
+    )
+    scenes.add_argument(
+        "--input", required=True, help="utterance list shared by users and programmes"
+    )
+    scenes.add_argument("--output", required=True, help="output directory")
+    scenes.add_argument("--count", type=int, required=True, help="number of scenes")
+    scenes.add_argument("--start", type=int, default=0, help="first scene index (for sharding)")
+    scenes.add_argument("--stems", action="store_true", help="also write per-source stems")
+    scenes.add_argument("--workers", type=int, default=default_workers)
+    _add_config_args(scenes)
+    scenes.set_defaults(func=cmd_scenes)
+
+    audit = sub.add_parser("audit", help="check a render manifest for level / duration shortcuts")
+    audit.add_argument("--manifest", required=True)
+    audit.add_argument("--limit", type=int, help="audit only the first N clips")
+    audit.add_argument("--output", help="write the full result as JSON")
+    audit.set_defaults(func=cmd_audit)
+
+    presets = sub.add_parser(
+        "presets", help="print the effective environment / device / content presets"
+    )
+    presets.add_argument("--section", choices=["environments", "devices", "content"])
+    presets.add_argument("--output", help="write YAML to a file instead of stdout")
+    _add_config_args(presets)
+    presets.set_defaults(func=cmd_presets)
+
+    sweep = sub.add_parser("sweep", help="write the measurement sweep to play through a device")
     sweep.add_argument("--output", default="sweep.wav")
     sweep.add_argument("--f1", type=float, default=50.0)
     sweep.add_argument("--f2", type=float, default=20000.0)
@@ -239,7 +413,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--sr", type=int, default=48000)
     sweep.set_defaults(func=cmd_sweep)
 
-    extract = sub.add_parser("extract", help="turn a recorded sweep into an IR + speaker model")
+    extract = sub.add_parser("extract", help="turn a recorded sweep into a device response")
     extract.add_argument("--recording", required=True, help="the recorded sweep")
     extract.add_argument("--output", required=True, help="output directory")
     extract.add_argument("--name", help="basename for the generated files")
@@ -255,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--output", help="write per-IR records as JSONL")
     stats.set_defaults(func=cmd_ir_stats)
 
-    test = sub.add_parser("selftest", help="verify the installation against known systems")
+    test = sub.add_parser("selftest", help="verify the installation against known answers")
     test.add_argument("--output", help="directory for demo audio")
     test.set_defaults(func=cmd_selftest)
 

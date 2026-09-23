@@ -1,7 +1,7 @@
 [project]
 name = "replay-opus"
-version = "0.1.0"
-description = "Batch simulation of loudspeaker playback and microphone re-recording"
+version = "0.2.0"
+description = "Render TTS speech as live talkers and as device playback in shared scenes, for full-duplex rejection training"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
@@ -12,7 +12,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-simulate = ["pyroomacoustics>=0.7"]
 plots = ["matplotlib>=3.8"]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 

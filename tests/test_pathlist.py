@@ -5,24 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import numpy as np
 import pytest
 import soundfile as sf
 
-from replay_opus.chain import ReplayChain
-from replay_opus.cli import main
-from replay_opus.config import Config
-from replay_opus.irbank import synth_ir
-from replay_opus.noise import NoiseBank
-from replay_opus.pathlist import _disambiguate, read_path_list, relative_labels
-from replay_opus.speaker import synth_speaker_kernels
+from replay_opus.pathlist import _disambiguate, read_path_list, read_utterances, relative_labels
 
-SR = 48_000
-
-
-@pytest.fixture
-def rng() -> np.random.Generator:
-    return np.random.default_rng(0)
+SR = 32_000
 
 
 def _write_wav(path, rng) -> None:
@@ -35,18 +23,7 @@ def test_read_path_list_skips_comments_quotes_and_duplicates(tmp_path, rng):
     _write_wav(audio, rng)
     listing = tmp_path / "lists" / "inputs.txt"
     listing.parent.mkdir()
-    listing.write_text(
-        "\n".join(
-            [
-                "# comment",
-                "",
-                "../a.wav",
-                '"../a.wav"',
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    listing.write_text('# comment\n\n../a.wav\n"../a.wav"\n', encoding="utf-8")
     got = read_path_list(listing, kind="input audio", suffixes=(".wav",))
     assert len(got) == 1
     assert got[0].samefile(audio)
@@ -91,86 +68,49 @@ def test_disambiguate_repeated_names():
     assert _disambiguate(["a.wav", "a.wav", "b.wav"]) == ["a.wav", "a__2.wav", "b.wav"]
 
 
-def test_measured_room_noise_and_speaker_come_from_lists(tmp_path, rng):
-    ir_path = tmp_path / "irs" / "room.wav"
-    ir_path.parent.mkdir()
-    sf.write(ir_path, synth_ir(SR, 0.3, 8.0, rng), SR)
-    ir_list = tmp_path / "irs.txt"
-    ir_list.write_text("irs/room.wav\n", encoding="utf-8")
-
-    noise_path = tmp_path / "noise" / "hvac.wav"
-    noise_path.parent.mkdir()
-    sf.write(noise_path, 0.01 * rng.standard_normal(SR), SR)
-    noise_list = tmp_path / "noise.txt"
-    noise_list.write_text("noise/hvac.wav\n", encoding="utf-8")
-
-    model = synth_speaker_kernels(SR, rng, "low")
-    model_path = tmp_path / "speakers" / "phone.npz"
-    model_path.parent.mkdir()
-    model.save(model_path)
-    model_list = tmp_path / "speakers.txt"
-    model_list.write_text("speakers/phone.npz\n", encoding="utf-8")
-
-    config = Config()
-    config.room.mode = "measured"
-    config.room.ir_list = str(ir_list)
-    config.noise.noise_list = str(noise_list)
-    config.playback.model_list = str(model_list)
-    chain = ReplayChain(config)
-    meta = chain.process(0.2 * rng.standard_normal(SR // 2), SR, key="a", variant=0).meta
-    assert meta["room_ir"] == "room.wav"
-    assert meta["noise"] == "hvac.wav"
-    assert meta["speaker"] == "synthetic:low"
-    assert "room_ir_measured" in meta
-
-
-def test_noise_bank_without_a_list_stays_synthetic(rng):
-    noise, label = NoiseBank.from_list(None, SR).sample(SR // 10, rng)
-    assert label.startswith("synthetic:")
-    assert len(noise) == SR // 10
-
-
-def test_cli_simulate_and_ir_stats_read_path_lists(tmp_path, rng):
-    src_dir = tmp_path / "in"
-    src_dir.mkdir()
-    sf.write(src_dir / "utt.wav", 0.2 * rng.standard_normal(SR // 5), SR)
-    inputs = tmp_path / "inputs.txt"
-    inputs.write_text("in/utt.wav\n", encoding="utf-8")
-
-    ir_path = tmp_path / "irs" / "room.wav"
-    ir_path.parent.mkdir()
-    sf.write(ir_path, synth_ir(SR, 0.25, 10.0, rng), SR)
-    ir_list = tmp_path / "irs.txt"
-    ir_list.write_text("irs/room.wav\n", encoding="utf-8")
-
-    out = tmp_path / "out"
-    code = main(
-        [
-            "simulate",
-            "--input",
-            str(inputs),
-            "--output",
-            str(out),
-            "--room-ir-list",
-            str(ir_list),
-            "--room-mode",
-            "measured",
-            "--workers",
-            "1",
-            "--variants",
-            "1",
-        ]
+def test_utterance_lists_carry_text_and_speaker(tmp_path, rng):
+    for name in ("a", "b", "c"):
+        _write_wav(tmp_path / "tts" / f"{name}.wav", rng)
+    listing = tmp_path / "inputs.txt"
+    listing.write_text(
+        "tts/a.wav\ntts/b.wav\t打开客厅的灯\ntts/c.wav\tspk7\tturn it\tdown\n",
+        encoding="utf-8",
     )
-    assert code == 0
-    assert (out / "utt.wav").is_file()
-    record = json.loads((out / "manifest.jsonl").read_text(encoding="utf-8"))
-    assert record["key"] == "utt.wav"
-    assert record["room_ir"] == "room.wav"
+    utts = read_utterances(listing)
+    assert [u.key for u in utts] == ["a.wav", "b.wav", "c.wav"]
+    assert (utts[0].text, utts[0].speaker) == (None, None)
+    assert (utts[1].text, utts[1].speaker) == ("打开客厅的灯", None)
+    assert (utts[2].text, utts[2].speaker) == ("turn it\tdown", "spk7")
+    # A list with text columns still reads as a plain path list.
+    assert len(read_path_list(listing, suffixes=(".wav",))) == 3
 
-    stats_path = tmp_path / "stats.jsonl"
-    code = main(["ir-stats", "--ir-list", str(ir_list), "--output", str(stats_path)])
-    assert code == 0
-    row = json.loads(stats_path.read_text(encoding="utf-8"))
-    assert row["ir"] == "room.wav"
-    assert {"t60_s", "drr_db", "c50_db", "length_ms"} <= set(row)
-    assert np.isfinite(row["t60_s"])
+
+def test_utterance_lists_in_jsonl(tmp_path, rng):
+    _write_wav(tmp_path / "x" / "a.wav", rng)
+    _write_wav(tmp_path / "x" / "b.wav", rng)
+    listing = tmp_path / "inputs.jsonl"
+    listing.write_text(
+        json.dumps({"audio": "x/a.wav", "text": "你好", "speaker": 3}, ensure_ascii=False)
+        + "\n"
+        + json.dumps({"path": "x/b.wav"})
+        + "\n",
+        encoding="utf-8",
+    )
+    utts = read_utterances(listing)
+    assert [(u.key, u.text, u.speaker) for u in utts] == [
+        ("a.wav", "你好", "3"),
+        ("b.wav", None, None),
+    ]
+    assert not list(tmp_path.glob(".*"))  # nothing staged next to the list
+
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text("{not json}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        read_utterances(broken)
+
+
+def test_utterance_list_errors_name_the_line(tmp_path):
+    listing = tmp_path / "inputs.txt"
+    listing.write_text("missing.wav\ttext\n", encoding="utf-8")
+    with pytest.raises(FileNotFoundError, match="line 1"):
+        read_utterances(listing)

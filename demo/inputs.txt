@@ -1,6 +1,14 @@
-# Clean clips used by the checked-in demo. One path per line, relative to this file.
-source_batch/tts_000.wav
-source_batch/tts_001.wav
-source_batch/tts_002.wav
-source_batch/tts_003.wav
-source_batch/tts_004.wav
+# Real TTS from the Windows speech synthesiser, 24 kHz mono.
+# One utterance per line: path<TAB>text, relative to this file.
+tts/zh_000.wav	帮我把客厅的灯关掉。
+tts/zh_001.wav	明天早上七点叫我起床。
+tts/zh_002.wav	今天北京的天气怎么样？
+tts/zh_003.wav	导航去最近的加油站。
+tts/zh_004.wav	把空调温度调到二十六度。
+tts/zh_005.wav	播放一首轻松一点的音乐。
+tts/zh_006.wav	观众朋友们晚上好，欢迎收看今天的晚间新闻。
+tts/zh_007.wav	据气象部门预报，明天白天有小到中雨，请大家出行注意安全。
+tts/zh_008.wav	你到底还要瞒我多久？这件事我早就知道了。
+tts/zh_009.wav	下面插播一条广告，精彩节目马上回来。
+tts/en_000.wav	Turn off the lights in the living room.
+tts/en_001.wav	Good evening, and welcome to the nine o'clock news.

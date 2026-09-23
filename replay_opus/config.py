@@ -1,97 +1,139 @@
-"""Configuration for the replay chain.
+"""Configuration: YAML in, nested dataclasses out.
 
-Every numeric field may be a scalar or a ``[low, high]`` range. Ranges are sampled
-once per generated variant, so one config describes a whole distribution of replay
-conditions rather than a single one.
+Numeric fields may be a scalar or a ``[low, high]`` range sampled per scene or per
+source, so one config describes a distribution of conditions. The environment,
+device and content *presets* live in code (``environment.py``, ``speaker.py``,
+``content.py``); the YAML only needs to hold what you change - any preset key can
+be overridden, and new presets added, through the ``*_presets`` / ``presets``
+sections, which are deep-merged over the built-ins.
 """
 
 from __future__ import annotations
 
+import copy
+import typing
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from .content import CONTENT_PROFILES
+from .environment import CAR_DEVICE_LAYOUTS, ENVIRONMENTS, ROOM_DEVICE_LAYOUTS
+from .speaker import DEVICE_PRESETS
+
 Range = float | list[float]
 
 
 @dataclass
-class PlaybackConfig:
-    enabled: bool = True
-    quality: list[str] = field(default_factory=lambda: ["perfect", "high", "low"])
-    quality_weights: list[float] = field(default_factory=lambda: [0.15, 0.50, 0.35])
-    drive_db: Range = field(default_factory=lambda: [-9.0, -2.0])
-    n_orders: int = 5
-    model_list: str | None = None
+class TalkerConfig:
+    level_dba: Range = field(default_factory=lambda: [55.0, 66.0])  # active speech level at 1 m
+    lombard_onset_dba: float = 45.0
+    lombard_slope: Range = field(default_factory=lambda: [0.2, 0.5])  # dB per dB(A) of noise
+    lombard_max_db: float = 12.0
+    effort_tilt_db_per_db: Range = field(default_factory=lambda: [0.2, 0.4])
+
+
+@dataclass
+class DeviceConfig:
+    weights: dict[str, float] | None = None  # replaces every environment's device mix
+    volume_slope: Range = field(default_factory=lambda: [0.0, 0.4])  # dB per dB(A) of noise
+    measured: dict[str, str] = field(default_factory=dict)  # device kind -> response list
+    measured_prob: float = 0.5
+    presets: dict[str, dict] = field(default_factory=dict)
+
+
+@dataclass
+class ContentConfig:
+    bed_list: str | None = None  # music / effects recordings mixed under programmes
+    weights: dict[str, float] | None = None  # replaces every device's content mix
+    profiles: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
 class RoomConfig:
-    enabled: bool = True
-    # measured: convolve IRs named in ir_list as-is
-    # reshaped: convolve those IRs retargeted to the sampled T60/DRR
-    # synthetic: build an IR from the sampled T60/DRR
-    # simulated: image-source method via pyroomacoustics
-    mode: str = "synthetic"
-    ir_list: str | None = None
-    t60_s: Range = field(default_factory=lambda: [0.08, 0.9])
-    drr_db: Range = field(default_factory=lambda: [-3.0, 20.0])
-    ir_max_ms: float = 1500.0
-    room_dim_m: list[float] = field(default_factory=lambda: [3.0, 3.0, 2.4])
-    room_dim_max_m: list[float] = field(default_factory=lambda: [8.0, 7.0, 3.2])
-    # Loudspeaker-to-microphone distance. ASVspoof 2019 PA spans 0.1-1.5 m;
-    # ASVspoof 2021 PA widened it to 0.5-2.0 m in real rooms.
-    distance_m: Range = field(default_factory=lambda: [0.2, 2.0])
+    measured: dict[str, str] = field(default_factory=dict)  # environment -> IR list
+    jitter_m: float = 0.05
+    early_ms: float | None = None
 
 
 @dataclass
 class NoiseConfig:
     enabled: bool = True
-    noise_list: str | None = None
-    snr_db: Range = field(default_factory=lambda: [12.0, 40.0])
+    lists: dict[str, str] = field(default_factory=dict)  # family (home / car) -> list
 
 
 @dataclass
 class CaptureConfig:
-    enabled: bool = True
+    fullscale_spl_db: Range = field(default_factory=lambda: [92.0, 112.0])
+    self_noise_dba: Range = field(default_factory=lambda: [22.0, 34.0])
     mic_ir_list: str | None = None
-    agc: bool = True
-    agc_target_dbfs: Range = field(default_factory=lambda: [-26.0, -16.0])
-    agc_max_gain_db: float = 30.0
-    adc_headroom_db: Range = field(default_factory=lambda: [-6.0, 1.0])
+    highpass_prob: float = 0.7
+    highpass_hz: Range = field(default_factory=lambda: [60.0, 150.0])
+    agc_prob: float = 0.4
+    agc_target_dbfs: Range = field(default_factory=lambda: [-28.0, -18.0])
+    agc_max_gain_db: float = 24.0
+    uplink_prob: float = 0.0
+    uplink_codecs: dict[str, float] = field(default_factory=lambda: {"opus": 1.0})
+    uplink_bitrate_kbps: Range = field(default_factory=lambda: [16.0, 32.0])
 
 
 @dataclass
-class TransportConfig:
-    enabled: bool = True
-    codecs: list[str | None] = field(default_factory=lambda: [None, "opus", "aac", "mp3"])
-    codec_weights: list[float] = field(default_factory=lambda: [0.30, 0.40, 0.15, 0.15])
-    bitrate_bps: Range = field(default_factory=lambda: [16_000, 64_000])
-    clock_drift_ppm: Range = field(default_factory=lambda: [-100.0, 100.0])
+class RenderConfig:
+    mode: str = "paired"  # paired | mixed | live | device
+    device_prob: float = 0.5  # share of device renders in mixed mode
+    tail_ms: float = 300.0
+
+
+@dataclass
+class SceneConfig:
+    duration_s: Range = field(default_factory=lambda: [10.0, 24.0])
+    types: dict[str, float] = field(
+        default_factory=lambda: {"both": 0.5, "device_only": 0.25, "live_only": 0.2, "empty": 0.05}
+    )
+    live_utterances: list[int] = field(default_factory=lambda: [1, 3])
+    live_min_gap_s: float = 0.4
+    device_gap_s: Range = field(default_factory=lambda: [0.15, 1.2])
+    device_continuous_prob: float = 0.7
+    device_voices: list[int] = field(default_factory=lambda: [1, 3])
+    second_device_prob: float = 0.1
+    save_stems: bool = False
 
 
 @dataclass
 class OutputConfig:
     sr: int = 16_000
-    peak_db: Range = field(default_factory=lambda: [-3.0, -1.0])
     subtype: str = "PCM_16"
-    suffix: str = ".wav"
-    # How much reverberant tail to keep past the end of the input. Convolution adds
-    # the full IR length, which would otherwise stretch every file by up to 1.5 s.
-    tail_ms: float = 300.0
+    format: str = "wav"  # wav | flac (lossless, roughly half the disk space)
+
+    @property
+    def suffix(self) -> str:
+        return f".{self.format}"
 
 
 @dataclass
 class Config:
     seed: int = 1234
-    sr_internal: int = 48_000
+    sr_internal: int = 32_000
     variants_per_file: int = 1
-    playback: PlaybackConfig = field(default_factory=PlaybackConfig)
+    environments: dict[str, float] = field(
+        default_factory=lambda: {
+            "living_room": 0.3,
+            "bedroom": 0.15,
+            "kitchen": 0.1,
+            "study": 0.05,
+            "car_cabin": 0.4,
+        }
+    )
+    environment_presets: dict[str, dict] = field(default_factory=dict)
+    talker: TalkerConfig = field(default_factory=TalkerConfig)
+    devices: DeviceConfig = field(default_factory=DeviceConfig)
+    content: ContentConfig = field(default_factory=ContentConfig)
     room: RoomConfig = field(default_factory=RoomConfig)
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
-    transport: TransportConfig = field(default_factory=TransportConfig)
+    render: RenderConfig = field(default_factory=RenderConfig)
+    scene: SceneConfig = field(default_factory=SceneConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
     @classmethod
@@ -103,46 +145,110 @@ class Config:
         if path is None:
             return cls()
         with open(path, encoding="utf-8") as handle:
-            return cls.from_dict(yaml.safe_load(handle))
+            config = cls.from_dict(yaml.safe_load(handle))
+        config.resolve_paths(Path(path).parent)
+        return config
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def resolve_paths(self, base: Path) -> None:
+        """Make list paths in a config file relative to the file, not to the shell."""
+
+        def fix(value: str | None) -> str | None:
+            if not value:
+                return value
+            p = Path(value)
+            return str(p if p.is_absolute() else (base / p))
+
+        self.content.bed_list = fix(self.content.bed_list)
+        self.capture.mic_ir_list = fix(self.capture.mic_ir_list)
+        for mapping in (self.room.measured, self.noise.lists, self.devices.measured):
+            for key, value in list(mapping.items()):
+                mapping[key] = fix(value)
+
+    # -- presets ---------------------------------------------------------------
+
+    def environment_table(self) -> dict[str, dict]:
+        table = deep_merge(ENVIRONMENTS, self.environment_presets)
+        if self.devices.weights is not None:
+            for preset in table.values():
+                layouts = CAR_DEVICE_LAYOUTS if preset["layout"] == "car" else ROOM_DEVICE_LAYOUTS
+                preset["devices"] = {k: w for k, w in self.devices.weights.items() if k in layouts}
+        return table
+
+    def device_table(self) -> dict[str, dict]:
+        table = deep_merge(DEVICE_PRESETS, self.devices.presets)
+        if self.content.weights is not None:
+            for preset in table.values():
+                preset["content"] = dict(self.content.weights)
+        return table
+
+    def content_table(self) -> dict[str, dict]:
+        return deep_merge(CONTENT_PROFILES, self.content.profiles)
+
     def validate(self) -> None:
-        if self.room.mode not in {"measured", "reshaped", "synthetic", "simulated"}:
-            raise ValueError(f"unknown room.mode {self.room.mode!r}")
-        if self.room.mode in {"measured", "reshaped"} and not self.room.ir_list:
-            raise ValueError(f"room.mode={self.room.mode!r} requires room.ir_list")
-        if len(self.playback.quality) != len(self.playback.quality_weights):
-            raise ValueError("playback.quality and playback.quality_weights differ in length")
-        if len(self.transport.codecs) != len(self.transport.codec_weights):
-            raise ValueError("transport.codecs and transport.codec_weights differ in length")
+        if self.render.mode not in {"paired", "mixed", "live", "device"}:
+            raise ValueError(
+                f"render.mode must be paired, mixed, live or device, got {self.render.mode!r}"
+            )
+        if self.output.sr > self.sr_internal:
+            raise ValueError("output.sr cannot exceed sr_internal")
+        if self.output.format not in {"wav", "flac"}:
+            raise ValueError(f"output.format must be wav or flac, got {self.output.format!r}")
+        envs = self.environment_table()
+        for name, weight in self.environments.items():
+            if name not in envs:
+                raise ValueError(f"unknown environment {name!r}; known: {sorted(envs)}")
+            if weight < 0:
+                raise ValueError(f"negative weight for environment {name!r}")
+        if not any(w > 0 for w in self.environments.values()):
+            raise ValueError("environments needs at least one positive weight")
+        unknown_types = set(self.scene.types) - {"both", "device_only", "live_only", "empty"}
+        if unknown_types:
+            raise ValueError(f"unknown scene type(s) {sorted(unknown_types)}")
+        _check_preset_links(envs, self.device_table(), self.content_table())
+
+
+def _check_preset_links(envs: dict, devices: dict, contents: dict) -> None:
+    """Every device an environment names must exist and be placeable there, and every
+    content profile a device names must exist."""
+    for name, preset in envs.items():
+        layouts = CAR_DEVICE_LAYOUTS if preset["layout"] == "car" else ROOM_DEVICE_LAYOUTS
+        for kind, weight in preset["devices"].items():
+            if weight > 0 and (kind not in devices or kind not in layouts):
+                raise ValueError(
+                    f"environment {name!r} lists device {kind!r}, which has no preset or placement"
+                )
+    for kind, preset in devices.items():
+        for profile in preset["content"]:
+            if profile not in contents:
+                raise ValueError(f"device {kind!r} lists unknown content profile {profile!r}")
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    out = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
 
 
 def _build(cls, data: dict[str, Any]):
+    hints = typing.get_type_hints(cls)
+    known = {f.name for f in fields(cls)}
     kwargs: dict[str, Any] = {}
-    known = {f.name: f for f in fields(cls)}
     for key, value in data.items():
         if key not in known:
             raise ValueError(f"unknown config key {key!r} in {cls.__name__}")
-        target = known[key].type
-        resolved = _SECTIONS.get((cls.__name__, key))
-        if resolved is not None and isinstance(value, dict):
-            kwargs[key] = _build(resolved, value)
-        elif is_dataclass(target) and isinstance(value, dict):
+        target = hints.get(key)
+        if is_dataclass(target) and isinstance(value, dict):
             kwargs[key] = _build(target, value)
         else:
             kwargs[key] = value
     return cls(**kwargs)
 
 
-# Field annotations are strings under ``from __future__ import annotations``, so the
-# nested dataclass types are resolved through this table instead of the annotation.
-_SECTIONS = {
-    ("Config", "playback"): PlaybackConfig,
-    ("Config", "room"): RoomConfig,
-    ("Config", "noise"): NoiseConfig,
-    ("Config", "capture"): CaptureConfig,
-    ("Config", "transport"): TransportConfig,
-    ("Config", "output"): OutputConfig,
-}
+__all__ = ["Config", "deep_merge"]

@@ -1,19 +1,25 @@
 """Path-list files: how a batch run names every input it draws from.
 
-Source audio, room IRs, microphone IRs, noise recordings and measured speaker models
-are each named by a text file holding one path per line, not by a directory. A
-directory is the wrong unit for this job: published IR and noise corpora ship their
-splits mixed into one tree, an experiment usually needs a subset (and needs the
-noise used for training kept away from the noise used for evaluation), and a rescan
-silently changes meaning the moment somebody drops a file in. A list is explicit,
-diffable, and reusable across runs.
+Source audio, room IRs, microphone IRs, noise recordings, music beds and measured
+device responses are each named by a text file holding one path per line, not by a
+directory. A directory is the wrong unit for this job: published IR and noise
+corpora ship their splits mixed into one tree, an experiment usually needs a subset
+(and needs the noise used for training kept away from the noise used for
+evaluation), and a rescan silently changes meaning the moment somebody drops a file
+in. A list is explicit, diffable, and reusable across runs.
+
+Utterance lists may carry more than the path: ``path<TAB>text`` or
+``path<TAB>speaker<TAB>text`` per line, or a ``.jsonl`` file with ``audio``, ``text``
+and ``speaker`` keys. Text and speaker pass straight through to the labels.
 """
 
 from __future__ import annotations
 
+import json
 import locale
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -45,6 +51,14 @@ def read_path_list(
     directory holding the list, so a list can travel with the data it names.
     Duplicates are dropped and the original order is kept.
     """
+    path = _check_list_file(list_path, kind)
+    entries = [
+        (lineno, raw.split("\t", 1)[0]) for lineno, raw in enumerate(read_text_lines(path), start=1)
+    ]
+    return _resolve(entries, path, kind, suffixes)
+
+
+def _check_list_file(list_path: str | Path, kind: str) -> Path:
     path = Path(list_path)
     if path.is_dir():
         raise ValueError(
@@ -52,20 +66,30 @@ def read_path_list(
         )
     if not path.is_file():
         raise FileNotFoundError(f"{kind} list not found: {path}")
+    return path
 
+
+def _resolve_entry(line: str, base: Path) -> Path:
+    entry = Path(line)
+    if not entry.is_absolute():
+        entry = base / entry
+    return Path(os.path.normpath(entry))
+
+
+def _resolve(
+    entries: list[tuple[int, str]], path: Path, kind: str, suffixes: tuple[str, ...] | None
+) -> list[Path]:
+    """Turn ``(line number, path text)`` entries into validated, de-duplicated paths."""
     paths: list[Path] = []
     seen: set[Path] = set()
     missing: list[str] = []
     bad_suffix: list[str] = []
     allowed = {suffix.lower() for suffix in suffixes} if suffixes else None
-    for lineno, raw in enumerate(read_text_lines(path), start=1):
+    for lineno, raw in entries:
         line = _unquote(raw)
         if not line or line.startswith("#"):
             continue
-        entry = Path(line)
-        if not entry.is_absolute():
-            entry = path.parent / entry
-        entry = Path(os.path.normpath(entry))
+        entry = _resolve_entry(line, path.parent)
         if entry in seen:
             continue
         if not entry.is_file():
@@ -90,6 +114,55 @@ def read_path_list(
     if not paths:
         raise ValueError(f"no {kind} paths in {path}")
     return paths
+
+
+@dataclass
+class Utterance:
+    path: Path
+    key: str  # path relative to the list's common root: file naming and RNG key
+    text: str | None = None
+    speaker: str | None = None
+
+
+def read_utterances(
+    list_path: str | Path, suffixes: tuple[str, ...] | None = None
+) -> list[Utterance]:
+    """Read an utterance list: a path list with optional text / speaker columns, or JSONL."""
+    kind = "input audio"
+    path = _check_list_file(list_path, kind)
+    entries: list[tuple[int, str]] = []
+    extras: dict[Path, tuple[str | None, str | None]] = {}
+    for lineno, raw in enumerate(read_text_lines(path), start=1):
+        if path.suffix.lower() == ".jsonl":
+            if not raw.strip() or raw.lstrip().startswith("#"):
+                continue
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{lineno}: not valid JSON ({exc.msg})") from exc
+            head = str(record.get("audio") or record.get("path") or "")
+            if not head:
+                raise ValueError(f"{path}:{lineno}: needs an 'audio' (or 'path') field")
+            text, speaker = record.get("text"), record.get("speaker")
+        else:
+            fields = raw.split("\t")
+            head = fields[0]
+            if len(fields) >= 3:
+                speaker, text = fields[1].strip() or None, "\t".join(fields[2:]).strip() or None
+            else:
+                speaker, text = None, (fields[1].strip() or None) if len(fields) == 2 else None
+        entries.append((lineno, head))
+        if _unquote(head) and not _unquote(head).startswith("#"):
+            extras[_resolve_entry(_unquote(head), path.parent)] = (
+                text,
+                None if speaker is None else str(speaker),
+            )
+    paths = _resolve(entries, path, kind, suffixes)
+    labels = relative_labels(paths)
+    return [
+        Utterance(p, label, *extras.get(p, (None, None)))
+        for p, label in zip(paths, labels, strict=True)
+    ]
 
 
 def common_root(paths: Sequence[Path]) -> Path | None:
@@ -152,4 +225,11 @@ def _format_lines(items: list[str]) -> str:
     return "\n".join(shown) + tail
 
 
-__all__ = ["common_root", "read_path_list", "read_text_lines", "relative_labels"]
+__all__ = [
+    "Utterance",
+    "common_root",
+    "read_path_list",
+    "read_text_lines",
+    "read_utterances",
+    "relative_labels",
+]

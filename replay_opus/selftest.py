@@ -1,8 +1,8 @@
-"""End-to-end checks against systems whose answers are known analytically.
+"""End-to-end checks against answers known in advance.
 
-Run with ``python -m replay_opus selftest``. Every assertion here is a property the
-pipeline must hold, not a regression snapshot, so the thresholds stay meaningful if
-the implementation changes.
+Run with ``python -m replay_opus selftest``. Every check is a property the pipeline
+must hold - a physical law or an invariant between the classes - not a snapshot, so
+the thresholds stay meaningful if the implementation changes.
 """
 
 from __future__ import annotations
@@ -13,40 +13,36 @@ import numpy as np
 import soundfile as sf
 from scipy import signal
 
-from .chain import ReplayChain
+from .acoustics import SPEED_OF_SOUND, Room, absorption_for_rt60, room_impulse_response
+from .codecs import CodecSpec, available_codecs, codec_roundtrip
+from .compose import SceneComposer
 from .config import Config
-from .dsp import align_to
-from .irbank import reshape_ir, synth_ir
+from .dsp import align_to, level_dba
+from .irbank import synth_ir
+from .loudness import integrated_loudness
 from .measure import SweepSpec, extract_linear_ir, generate_sweep, harmonic_profile
-from .metrics import describe_ir
-from .transport import CodecSpec, available_codecs, codec_roundtrip
+from .metrics import estimate_drr, estimate_t60
+from .pathlist import Utterance
+from .render import UtteranceRenderer
 
-SR = 48_000
-
-
-def _residual_db(estimate: np.ndarray, reference: np.ndarray) -> float:
-    n = min(len(estimate), len(reference))
-    a, b = estimate[:n], reference[:n]
-    gain = float(np.dot(b, a) / (np.dot(a, a) + 1e-30))
-    residual = gain * a - b
-    return float(
-        20.0 * np.log10(np.sqrt(np.mean(residual**2)) / (np.sqrt(np.mean(b**2)) + 1e-30) + 1e-15)
-    )
+SR = 32_000
 
 
-def _speech_like(rng: np.random.Generator, seconds: float = 3.0) -> np.ndarray:
-    """A harmonic-plus-noise signal with a speech-shaped spectrum and syllabic envelope."""
+def _speech_like(rng: np.random.Generator, seconds: float = 1.5, lead: float = 0.3) -> np.ndarray:
+    """Harmonic bursts with a speech-shaped spectrum, framed by silence."""
     n = int(SR * seconds)
     t = np.arange(n) / SR
-    f0 = 120.0 + 20.0 * np.sin(2.0 * np.pi * 1.7 * t)
-    phase = 2.0 * np.pi * np.cumsum(f0) / SR
-    excitation = sum(np.sin(k * phase) / k for k in range(1, 25))
-    excitation += 0.15 * rng.standard_normal(n)
-    sos = signal.butter(2, (200.0 / (SR / 2), 3500.0 / (SR / 2)), btype="band", output="sos")
-    shaped = signal.sosfilt(sos, excitation)
-    envelope = 0.5 + 0.5 * np.sin(2.0 * np.pi * 3.0 * t) ** 2
-    out = shaped * envelope
-    return 0.5 * out / (np.max(np.abs(out)) + 1e-12)
+    phase = 2 * np.pi * np.cumsum(140.0 * (1 + 0.08 * np.sin(2 * np.pi * 1.3 * t))) / SR
+    voiced = sum(np.sin(k * phase) / k for k in range(1, 40)) + 0.1 * rng.standard_normal(n)
+    sos = signal.butter(2, (150 / (SR / 2), 5000 / (SR / 2)), btype="band", output="sos")
+    burst = signal.sosfilt(sos, voiced) * (0.3 + 0.7 * np.sin(2 * np.pi * 3.5 * t) ** 2)
+    burst = 0.5 * burst / np.max(np.abs(burst))
+    return np.concatenate([np.zeros(int(SR * lead)), burst, np.zeros(int(SR * 0.2))])
+
+
+def _band(h: np.ndarray, fc: float) -> np.ndarray:
+    sos = signal.butter(3, (fc / 1.41 / (SR / 2), fc * 1.41 / (SR / 2)), btype="band", output="sos")
+    return signal.sosfiltfilt(sos, h)
 
 
 def run_selftest(output_dir: Path | None = None) -> int:
@@ -58,105 +54,142 @@ def run_selftest(output_dir: Path | None = None) -> int:
         if not ok:
             failures.append(name)
 
-    print("IR synthesis")
-    for t60, drr in ((0.15, 15.0), (0.5, 5.0), (1.2, 0.0)):
-        got = describe_ir(synth_ir(SR, t60, drr, rng), SR)
-        ok = abs(got["t60_s"] - t60) / t60 < 0.1 and abs(got["drr_db"] - drr) < 0.5
-        check(
-            f"synth_ir T60={t60} DRR={drr}",
-            ok,
-            f"got T60={got['t60_s']:.3f} DRR={got['drr_db']:.2f}",
-        )
+    print("Levels")
+    t = np.arange(3 * 48_000) / 48_000
+    lufs = integrated_loudness(np.sin(2 * np.pi * 997 * t), 48_000)
+    check("BS.1770 full-scale sine", abs(lufs + 3.01) < 0.05, f"{lufs:.2f} LUFS (want -3.01)")
+    tone = np.sqrt(2) * np.sin(2 * np.pi * 1000 * np.arange(SR) / SR)
+    dba = level_dba(tone, SR)
+    check("A-weighted 1 Pa tone", abs(dba - 94.0) < 0.1, f"{dba:.2f} dB(A) (want 94.0)")
 
-    print("IR retargeting")
-    base = synth_ir(SR, 0.9, 5.0, rng)
-    got = describe_ir(reshape_ir(base, SR, 0.3, 18.0), SR)
+    print("Room acoustics")
+    dims = np.array([5.5, 4.2, 2.7])
+    room = Room(dims, absorption_for_rt60(dims, np.full(7, 0.55), np.array([1, 1, 1, 1, 1.5, 0.8])))
+    src = np.array([1.0, 2.0, 1.2])
+    far = [
+        room_impulse_response(room, src, [4.2, 2.6, 1.0], SR, np.random.default_rng(s))[0]
+        for s in range(3)
+    ]
+    t30 = float(np.median([estimate_t60(_band(h, 1000.0), SR) for h in far]))
+    want = float(room.rt60()[3])
     check(
-        "reshape_ir to T60=0.30 DRR=18",
-        abs(got["t60_s"] - 0.3) / 0.3 < 0.1 and abs(got["drr_db"] - 18.0) < 0.5,
-        f"got T60={got['t60_s']:.3f} DRR={got['drr_db']:.2f}",
+        "RT60 at 1 kHz follows Eyring",
+        abs(t30 - want) / want < 0.12,
+        f"{t30:.3f} s (want {want:.3f})",
     )
-
-    print("Sweep measurement")
-    spec = SweepSpec(sr=SR)
-    sweep, _, _ = generate_sweep(spec)
-    room = synth_ir(SR, 0.45, 8.0, rng)
-    measured, _ = extract_linear_ir(signal.fftconvolve(sweep, room), spec, ir_ms=1500)
-    got, truth = describe_ir(measured, SR), describe_ir(room, SR)
-    check(
-        "room IR recovered from a sweep",
-        abs(got["t60_s"] - truth["t60_s"]) < 0.02 and abs(got["drr_db"] - truth["drr_db"]) < 0.5,
-        f"T60 {truth['t60_s']:.3f}->{got['t60_s']:.3f}, "
-        f"DRR {truth['drr_db']:.2f}->{got['drr_db']:.2f}",
+    near = [
+        room_impulse_response(room, src, src + np.array([1.0, 0, 0]), SR, np.random.default_rng(s))[
+            0
+        ]
+        for s in range(3)
+    ]
+    drr = float(np.mean([estimate_drr(h, SR) for h in near]))
+    theory = 10 * np.log10(
+        1.0 / (312.2 * want / room.volume * np.exp(-13.82 / SPEED_OF_SOUND / want))
     )
-
-    probe = _speech_like(rng)
-    predicted, _ = align_to(signal.fftconvolve(probe, measured), signal.fftconvolve(probe, room))
-    residual = _residual_db(predicted, signal.fftconvolve(probe, room))
-    check("measured IR reproduces the system", residual < -30.0, f"{residual:.1f} dB residual")
-
-    c2, c3 = 0.30, 0.10
-    profile = harmonic_profile(sweep + c2 * sweep**2 + c3 * sweep**3, spec, [1, 2, 3, 4])
-    want2 = 20.0 * np.log10(0.5 * c2 / (1 + 0.75 * c3))
-    want3 = 20.0 * np.log10(0.25 * c3 / (1 + 0.75 * c3))
     check(
-        "harmonic profile of a known polynomial",
-        abs(profile["level_db"][1] - want2) < 0.2 and abs(profile["level_db"][2] - want3) < 0.2,
-        f"H2 {profile['level_db'][1]:.2f} (want {want2:.2f}), "
-        f"H3 {profile['level_db'][2]:.2f} (want {want3:.2f})",
+        "DRR at 1 m follows diffuse theory",
+        abs(drr - theory) < 2.0,
+        f"{drr:.2f} dB (theory {theory:.2f})",
     )
 
     print("Codecs")
-    tone = _speech_like(rng, 2.0)
-    # AMR-NB is a parametric narrowband vocoder, not a waveform coder, so it is held
-    # to a far looser level tolerance than the transform codecs.
-    tolerances = {"amr_nb": (0.3, 1.6)}
+    burst = _speech_like(rng, 1.0, 0.0)
     for name in available_codecs():
-        decoded, meta = codec_roundtrip(tone, SR, CodecSpec(name))
-        gain = float(np.dot(tone, decoded[: len(tone)]) / np.dot(tone, tone))
-        low, high = tolerances.get(name, (0.9, 1.1))
+        decoded, meta = codec_roundtrip(burst, SR, CodecSpec(name))
+        lag = align_to(decoded, burst)[1]
         check(
             f"{name} round trip",
-            len(decoded) == len(tone) and low < gain < high,
-            f"gain={gain:.3f}, delay={meta['codec_delay_samples']} samples compensated",
+            len(decoded) == len(burst) and abs(lag) <= 2,
+            f"{meta['codec_sr']} Hz, residual lag {lag} samples",
         )
 
-    print("Full chain")
-    config = Config()
-    config.room.mode = "synthetic"
-    chain = ReplayChain(config)
-    source = _speech_like(rng, 3.0)
-    result = chain.process(source, SR, key="selftest", variant=0)
+    print("Device measurement")
+    spec = SweepSpec(sr=48_000)
+    sweep, _, _ = generate_sweep(spec)
+    system = synth_ir(48_000, 0.3, 8.0, rng)
+    measured, _ = extract_linear_ir(signal.fftconvolve(sweep, system), spec, ir_ms=1000)
+    # Probe inside the sweep's band: outside it the measurement has nothing to recover.
+    band = signal.butter(4, (200 / 24_000, 6000 / 24_000), btype="band", output="sos")
+    probe = signal.sosfilt(band, rng.standard_normal(48_000))
+    truth = signal.fftconvolve(probe, system)
+    pred, _ = align_to(signal.fftconvolve(probe, measured), truth)
+    n = min(len(pred), len(truth))
+    gain = np.dot(truth[:n], pred[:n]) / np.dot(pred[:n], pred[:n])
+    residual = 20 * np.log10(np.std(gain * pred[:n] - truth[:n]) / np.std(truth[:n]))
+    check("sweep recovers the system", residual < -30.0, f"{residual:.1f} dB residual")
+    profile = harmonic_profile(sweep + 0.3 * sweep**2, spec, [1, 2, 3])
+    want_h2 = 20 * np.log10(0.15)
     check(
-        "chain produces audio at the configured rate",
-        result.sr == config.output.sr and len(result.audio) > SR,
-        f"{len(result.audio)} samples @ {result.sr} Hz",
-    )
-    check(
-        "chain output is not clipped",
-        float(np.max(np.abs(result.audio))) <= 1.0,
-        f"peak {20 * np.log10(np.max(np.abs(result.audio)) + 1e-12):.2f} dBFS",
-    )
-    repeat = chain.process(source, SR, key="selftest", variant=0)
-    check(
-        "same seed reproduces the same output",
-        bool(np.array_equal(result.audio, repeat.audio)),
-        "bit-identical on re-run",
-    )
-    varied = chain.process(source, SR, key="selftest", variant=1)
-    check(
-        "different variant gives different conditions",
-        not np.array_equal(result.audio[: len(varied.audio)], varied.audio[: len(result.audio)]),
-        "variant 1 differs from variant 0",
+        "second harmonic of a known polynomial",
+        abs(profile["level_db"][1] - want_h2) < 0.2,
+        f"{profile['level_db'][1]:.2f} dB (want {want_h2:.2f})",
     )
 
-    if output_dir:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        sf.write(output_dir / "source.wav", source, SR, subtype="PCM_16")
-        for variant in range(4):
-            out = chain.process(source, SR, key="selftest", variant=variant)
-            sf.write(output_dir / f"replayed_v{variant}.wav", out.audio, out.sr, subtype="PCM_16")
-        print(f"\ndemo audio written to {output_dir}")
+    print("Paired rendering")
+    config = Config()
+    config.capture.agc_prob = 0.0
+    config.content.weights = {"broadcast": 1.0}
+    config.content.profiles = {"broadcast": {"codecs": {"none": 1.0}, "source_room_prob": 0.0}}
+    renderer = UtteranceRenderer(config)
+    speech = _speech_like(rng)
+    live, device = renderer.render(speech, SR, "selftest", 0)
+    check(
+        "both classes rendered",
+        (live.label, device.label) == ("live", "device"),
+        f"{live.meta['scene']['environment']}, {device.meta['source']['device']}",
+    )
+    check(
+        "same scene, same length",
+        live.meta["scene"] == device.meta["scene"] and len(live.audio) == len(device.audio),
+        f"{len(live.audio)} samples @ {live.sr} Hz",
+    )
+    lead = int(0.2 * live.sr)
+    same = float(np.max(np.abs(live.audio[:lead] - device.audio[:lead])))
+    check("identical noise before the speech", same < 1e-6, f"max difference {same:.1e}")
+    again = renderer.render(speech, SR, "selftest", 0)
+    check(
+        "same seed, same output",
+        all(np.array_equal(a.audio, b.audio) for a, b in zip((live, device), again, strict=True)),
+        "bit-identical",
+    )
+
+    print("Full-duplex scenes")
+    scratch = Path(output_dir) if output_dir else None
+    utt_dir = scratch or Path.cwd()
+    utt_path = utt_dir / "_selftest_utt.wav"
+    sf.write(utt_path, speech, SR)
+    try:
+        scene_config = Config()
+        scene_config.scene.duration_s = [6.0, 6.0]
+        scene_config.scene.types = {"both": 1.0}
+        scene_config.scene.save_stems = True
+        scene = SceneComposer(scene_config, [Utterance(utt_path, "utt.wav", "selftest")]).compose(0)
+        contrasts = []
+        for name, stem in scene.stems.items():
+            mask = np.zeros(len(stem), bool)
+            for s in scene.segments:
+                if s["source"] == name:
+                    mask[int(s["start"] * scene.sr) : int(s["end"] * scene.sr)] = True
+            if mask.any() and (~mask).any():
+                contrasts.append(
+                    10 * np.log10(np.mean(stem[mask] ** 2) / (np.mean(stem[~mask] ** 2) + 1e-20))
+                )
+        check(
+            "labels sit on the sources",
+            bool(contrasts) and min(contrasts) > 10.0,
+            f"energy inside vs outside labels: {', '.join(f'{c:.0f} dB' for c in contrasts)}",
+        )
+    finally:
+        utt_path.unlink(missing_ok=True)
+
+    if scratch:
+        scratch.mkdir(parents=True, exist_ok=True)
+        sf.write(scratch / "source.wav", speech, SR, subtype="PCM_16")
+        sf.write(scratch / "live.wav", live.audio, live.sr, subtype="PCM_16")
+        sf.write(scratch / "device.wav", device.audio, device.sr, subtype="PCM_16")
+        sf.write(scratch / "scene.wav", scene.audio, scene.sr, subtype="PCM_16")
+        print(f"\ndemo audio written to {scratch}")
 
     print()
     if failures:

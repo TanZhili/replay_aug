@@ -1,117 +1,146 @@
-"""Capture stage: microphone response, converter clipping, recorder-side gain control.
+"""Capture side: the device your full-duplex model listens through.
 
-This is the part that pure RIR convolution skips, and it is a large part of why
-RIR-only augmentation recovers only some of the replay effect. A phone or a meeting
-client runs high-pass -> AEC -> noise suppression -> AGC before anything reaches disk.
+Everything here is shared by every source in a scene, which is the point: a live
+talker and a TV reach the model through the same MEMS microphone, the same
+self-noise, the same gain staging, the same front-end high-pass and AGC and the same
+converter. Whatever differs between the classes must therefore come from the
+sources themselves, never from how they were recorded.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import numpy as np
 from scipy import signal
 
-from .dsp import EPS, butter, random_spectral_tilt, set_peak_db
+from .codecs import CodecSpec, codec_roundtrip
+from .dsp import (
+    P_REF,
+    apply_sos,
+    butter_sos,
+    cascade,
+    choose,
+    peaking_sos,
+    resample_to,
+    sample_range,
+)
+from .dynamics import agc
+from .noise import scale_to_dba
 
 
-def apply_mic_response(
-    x: np.ndarray,
-    sr: int,
-    rng: np.random.Generator,
-    mic_ir: np.ndarray | None = None,
-    hp_hz: tuple[float, float] = (40.0, 140.0),
-    lp_hz: tuple[float, float] = (7000.0, 18000.0),
-    tilt_bands: int = 3,
-    tilt_db: float = 4.0,
-) -> tuple[np.ndarray, dict]:
-    """Convolve a measured microphone IR, or synthesise a plausible one.
+@dataclass
+class Capture:
+    fullscale_spl_db: float  # SPL of a full-scale sine at the converter, after all gain
+    self_noise_dba: float
+    mic_sos: np.ndarray
+    mic_ir: np.ndarray | None
+    highpass_hz: float | None
+    agc: dict | None
+    uplink: dict | None
+    meta: dict = field(default_factory=dict)
 
-    Measured IRs for 20 phone models are available from POLIPHONE; pass one in via
-    ``mic_ir`` to make the output sound like that specific handset.
-    """
-    if mic_ir is not None:
-        return signal.fftconvolve(x, mic_ir, mode="full"), {"mic": "measured_ir"}
+    def describe(self) -> dict:
+        return {
+            "fullscale_spl_db": round(self.fullscale_spl_db, 2),
+            "self_noise_dba": round(self.self_noise_dba, 2),
+            "highpass_hz": None if self.highpass_hz is None else round(self.highpass_hz, 1),
+            "agc": self.agc,
+            "uplink": self.uplink,
+            **self.meta,
+        }
 
-    hp = float(rng.uniform(*hp_hz))
-    lp = float(rng.uniform(*lp_hz))
-    y = butter(x, sr, hp, kind="high", order=2)
-    y = butter(y, sr, min(lp, 0.98 * sr / 2), kind="low", order=4)
-    y, tilt = random_spectral_tilt(y, sr, rng, n_bands=tilt_bands, max_gain_db=tilt_db)
-    return y, {
-        "mic": "synthetic",
+
+def mic_response_sos(sr: int, rng: np.random.Generator) -> tuple[np.ndarray, dict]:
+    """A MEMS capsule: low-frequency vent roll-off, port resonance, small tilt."""
+    hp = float(np.exp(rng.uniform(np.log(30.0), np.log(150.0))))
+    order = int(rng.choice([1, 2]))
+    res_f = rng.uniform(9000.0, 15000.0)
+    res_db = rng.uniform(1.0, 6.0)
+    parts = [
+        butter_sos(sr, hp, "high", order),
+        peaking_sos(sr, res_f, res_db, rng.uniform(1.5, 4.0)),
+    ]
+    tilt = []
+    for _ in range(2):
+        f0 = float(np.exp(rng.uniform(np.log(200.0), np.log(6000.0))))
+        g = rng.uniform(-1.5, 1.5)
+        parts.append(peaking_sos(sr, f0, g, rng.uniform(0.5, 1.5)))
+        tilt.append({"f0_hz": round(f0, 1), "gain_db": round(g, 2)})
+    return cascade(*parts), {
         "mic_hp_hz": round(hp, 1),
-        "mic_lp_hz": round(lp, 1),
+        "mic_hp_order": order,
+        "mic_resonance_hz": round(res_f, 1),
+        "mic_resonance_db": round(res_db, 2),
         "mic_tilt": tilt,
     }
 
 
-def simple_agc(
-    x: np.ndarray,
-    sr: int,
-    target_dbfs: float = -20.0,
-    max_gain_db: float = 30.0,
-    attack_ms: float = 20.0,
-    release_ms: float = 400.0,
-    frame_ms: float = 10.0,
-    level_decay_db_s: float = 6.0,
+def sample_capture(
+    cfg, sr: int, rng: np.random.Generator, mic_irs=None, available_codecs=()
+) -> Capture:
+    sos, meta = mic_response_sos(sr, rng)
+    mic_ir = None
+    if mic_irs is not None and len(mic_irs):
+        mic_ir, label = mic_irs.sample(rng)
+        sos = np.zeros((0, 6))
+        meta = {"mic_ir": label}
+    highpass = sample_range(rng, cfg.highpass_hz) if rng.random() < cfg.highpass_prob else None
+    agc_cfg = None
+    if rng.random() < cfg.agc_prob:
+        agc_cfg = {
+            "target_dbfs": round(sample_range(rng, cfg.agc_target_dbfs), 2),
+            "max_gain_db": float(cfg.agc_max_gain_db),
+        }
+    uplink = None
+    usable = {k: w for k, w in cfg.uplink_codecs.items() if k in available_codecs}
+    if usable and rng.random() < cfg.uplink_prob:
+        uplink = {
+            "codec": choose(rng, usable),
+            "bitrate_kbps": round(sample_range(rng, cfg.uplink_bitrate_kbps), 2),
+        }
+    return Capture(
+        fullscale_spl_db=sample_range(rng, cfg.fullscale_spl_db),
+        self_noise_dba=sample_range(rng, cfg.self_noise_dba),
+        mic_sos=sos,
+        mic_ir=mic_ir,
+        highpass_hz=highpass,
+        agc=agc_cfg,
+        uplink=uplink,
+        meta=meta,
+    )
+
+
+def to_digital(p_mic: np.ndarray, sr: int, cap: Capture) -> np.ndarray:
+    """Microphone response and gain staging: pascals in, full-scale units out."""
+    x = np.asarray(p_mic, dtype=np.float64)
+    if cap.mic_ir is not None:
+        x = signal.fftconvolve(x, cap.mic_ir)[: len(x)]
+    x = apply_sos(x, cap.mic_sos)
+    return x / (np.sqrt(2.0) * P_REF * 10.0 ** (cap.fullscale_spl_db / 20.0))
+
+
+def capture(
+    p_mic: np.ndarray, sr: int, out_sr: int, cap: Capture, noise_rng: np.random.Generator
 ) -> tuple[np.ndarray, dict]:
-    """Automatic gain control driven by a decaying estimate of the speech level.
-
-    The gain follows a peak-hold estimate of the *speech* level, not the level of the
-    current frame. Driving it from frame level directly makes the AGC spend its whole
-    range on pauses and lift the noise floor above the speech - pumping that no real
-    recorder produces. Here the estimate falls at ``level_decay_db_s``, so a pause
-    breathes a few dB rather than tens.
-
-    A simplification of WebRTC AGC2; for bit-accurate behaviour run the real thing
-    through the ``pywebrtc-audio`` bindings.
-    """
-    hop = max(1, int(sr * frame_ms / 1000.0))
-    target_rms = 10.0 ** (target_dbfs / 20.0)
-    max_gain = 10.0 ** (max_gain_db / 20.0)
-    decay = 10.0 ** (-level_decay_db_s * frame_ms / 1000.0 / 20.0)
-    a_attack = np.exp(-frame_ms / max(attack_ms, 1e-3))
-    a_release = np.exp(-frame_ms / max(release_ms, 1e-3))
-
-    n_frames = int(np.ceil(len(x) / hop))
-    padded = np.pad(x, (0, n_frames * hop - len(x)))
-    frame_level = np.sqrt(np.mean(padded.reshape(n_frames, hop) ** 2, axis=1) + EPS)
-    # Never chase a level more than 40 dB below the loud passages: that region is
-    # noise, and tracking it is what produces the pumping described above.
-    floor = float(np.percentile(frame_level, 90)) * 10.0 ** (-40.0 / 20.0)
-
-    gains = np.ones(n_frames)
-    speech_level = max(float(frame_level[0]), floor)
-    gain = 1.0
-    for i in range(n_frames):
-        speech_level = max(float(frame_level[i]), speech_level * decay, floor)
-        wanted = float(np.clip(target_rms / speech_level, 1.0 / max_gain, max_gain))
-        alpha = a_attack if wanted < gain else a_release
-        gain = alpha * gain + (1.0 - alpha) * wanted
-        gains[i] = gain
-
-    envelope = np.repeat(gains, hop)[: len(x)]
-    return x * envelope, {
-        "agc_target_dbfs": round(float(target_dbfs), 2),
-        "agc_gain_db_range": [
-            round(float(20.0 * np.log10(gains.min() + EPS)), 2),
-            round(float(20.0 * np.log10(gains.max() + EPS)), 2),
-        ],
-    }
+    """Self-noise, microphone, gain, front end, converter, optional uplink codec."""
+    self_noise = scale_to_dba(noise_rng.standard_normal(len(p_mic)), sr, cap.self_noise_dba)
+    x = to_digital(p_mic + self_noise, sr, cap)
+    meta: dict = {}
+    if cap.highpass_hz is not None:
+        x = apply_sos(x, butter_sos(sr, cap.highpass_hz, "high", 2))
+    if cap.agc is not None:
+        x, agc_meta = agc(x, sr, cap.agc["target_dbfs"], cap.agc["max_gain_db"])
+        meta.update(agc_meta)
+    clipped = int(np.sum(np.abs(x) > 1.0))
+    x = np.clip(x, -1.0, 1.0)
+    meta["clipped_pct"] = round(100.0 * clipped / max(len(x), 1), 4)
+    if cap.uplink is not None:
+        spec = CodecSpec(cap.uplink["codec"], int(cap.uplink["bitrate_kbps"] * 1000))
+        x, codec_meta = codec_roundtrip(x, sr, spec)
+        meta["uplink_codec_sr"] = codec_meta["codec_sr"]
+    y = resample_to(x, sr, out_sr)
+    return np.clip(y, -1.0, 1.0), meta
 
 
-def adc_clip(x: np.ndarray, headroom_db: float = -1.0) -> tuple[np.ndarray, dict]:
-    """Set the recording level relative to full scale, then hard-clip.
-
-    ``headroom_db`` is where the signal peak lands: negative leaves headroom, positive
-    means the level was set too hot and the peaks clip. Real recordings are levelled
-    by a person or an AGC rather than by the signal, so a fraction of them do clip -
-    a config range spanning zero reproduces that.
-    """
-    y = set_peak_db(x, headroom_db)
-    clipped = int(np.sum(np.abs(y) > 1.0))
-    y = np.clip(y, -1.0, 1.0)
-    return y, {
-        "adc_headroom_db": round(float(headroom_db), 2),
-        "clipped_samples": clipped,
-        "clipped_pct": round(100.0 * clipped / max(len(y), 1), 4),
-    }
+__all__ = ["Capture", "capture", "mic_response_sos", "sample_capture", "to_digital"]

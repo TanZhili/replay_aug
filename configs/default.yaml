@@ -1,69 +1,85 @@
-# Default replay conditions.
+# Default configuration. Loading this file gives exactly the built-in defaults.
 #
-# Any numeric field written as [low, high] is sampled once per generated variant,
-# so this file describes a distribution of replay conditions, not a single one.
-# Ranges follow the ASVspoof 2019/2021 physical-access protocols where those define
-# a convention; see README.md for the mapping.
+# Any numeric field written as [low, high] is sampled per scene or per source, so
+# this file describes a distribution of conditions, not a single one.
+#
+# Environment, device and content *presets* (room sizes, reverberation, placements,
+# loudspeaker responses, programme chains...) live in code. Print the effective ones
+# with `python -m replay_opus presets`, and override any key in the *_presets /
+# presets sections below; overrides are deep-merged over the built-ins.
 
 seed: 1234
-sr_internal: 48000      # the chain runs wideband and downsamples only at the end
-variants_per_file: 1    # distinct replay conditions per input file
+sr_internal: 32000        # processing rate; use 48000 if output.sr is 24000 or more
+variants_per_file: 1      # render: scenes per input utterance
 
-playback:
-  enabled: true
-  # Device grades mirror the perfect / high / low replay-device quality of
-  # ASVspoof 2019 PA. "low" is a phone earpiece, "perfect" is a studio monitor.
-  quality: [perfect, high, low]
-  quality_weights: [0.15, 0.50, 0.35]
-  drive_db: [-9.0, -2.0]   # peak level fed into the non-linearity; sets distortion
-  n_orders: 5              # first five harmonics carry the bulk of the distortion
-  model_list: null         # path list of measured .npz models; overrides the grades
+# Which environments scenes are drawn from, by weight. Built in: living_room,
+# bedroom, kitchen, study, car_cabin.
+environments:
+  living_room: 0.30
+  bedroom: 0.15
+  kitchen: 0.10
+  study: 0.05
+  car_cabin: 0.40
+environment_presets: {}   # e.g. {car_cabin: {drive_side: right}}, or a whole new environment
+
+talker:                   # the live user
+  level_dba: [55.0, 66.0]           # active speech level at 1 m, casual to raised voice
+  lombard_onset_dba: 45.0           # noise level where people start raising their voice
+  lombard_slope: [0.2, 0.5]         # dB of voice per dB(A) of noise above the onset
+  lombard_max_db: 12.0
+  effort_tilt_db_per_db: [0.2, 0.4] # raised voice is brighter, soft voice duller
+
+devices:                  # the playback side
+  weights: null           # replaces every environment's device mix, e.g. {tv: 1.0}
+  volume_slope: [0.0, 0.4]          # how far listeners turn the volume up in noise, dB/dB
+  measured: {}            # device kind -> list of near-field responses (from `extract`)
+  measured_prob: 0.5      # share of devices of that kind that use a measured response
+  presets: {}             # e.g. {tv: {level_dba: [60, 72]}}
+
+content:                  # what the device is playing
+  bed_list: null          # music / effects recordings to mix under programmes
+  weights: null           # replaces every device's content mix, e.g. {phone_call: 1.0}
+  profiles: {}            # e.g. {streaming: {bed_prob: 0.8}}
 
 room:
-  # measured  - convolve IRs named in ir_list unchanged
-  # reshaped  - convolve those IRs retargeted to the sampled T60/DRR
-  # synthetic - build an IR from the sampled T60/DRR (no downloads needed)
-  # simulated - image-source method, needs pyroomacoustics
-  enabled: true
-  mode: synthetic
-  ir_list: null            # text file, one IR path per line; not a directory
-  t60_s: [0.08, 0.90]      # ASVspoof 2019 PA spans 0.05-1.0 s
-  drr_db: [-3.0, 20.0]
-  ir_max_ms: 1500.0
-  room_dim_m: [3.0, 3.0, 2.4]       # lower corner of the sampled room size
-  room_dim_max_m: [8.0, 7.0, 3.2]   # upper corner
-  # Loudspeaker-to-microphone distance, only used by mode: simulated.
-  # ASVspoof 2019 PA spans 0.1-1.5 m; 2021 PA widened it to 0.5-2.0 m.
-  distance_m: [0.2, 2.0]
+  measured: {}            # environment -> list of measured IRs, one directory per room
+  jitter_m: 0.05          # randomised image positions; breaks up flutter echoes
+  early_ms: null          # image-source part length; null picks 2x the mixing time
 
 noise:
   enabled: true
-  noise_list: null         # text file of real room "silence"; see README
-  snr_db: [12.0, 40.0]
+  lists: {}               # family -> list of real noise recordings, e.g. {home: ..., car: ...}
 
-capture:
-  enabled: true
-  mic_ir_list: null        # text file of microphone IRs, e.g. POLIPHONE
-  agc: true
-  agc_target_dbfs: [-26.0, -16.0]
-  agc_max_gain_db: 30.0
-  # Where the peak lands relative to full scale. The range crosses zero on purpose:
-  # a minority of real recordings are levelled too hot and clip.
-  adc_headroom_db: [-6.0, 1.0]
+capture:                  # the device the full-duplex model listens through
+  fullscale_spl_db: [92.0, 112.0]   # SPL that reaches digital full scale
+  self_noise_dba: [22.0, 34.0]      # MEMS microphone self-noise
+  mic_ir_list: null                 # measured microphone responses replace the model
+  highpass_prob: 0.7
+  highpass_hz: [60.0, 150.0]
+  agc_prob: 0.4
+  agc_target_dbfs: [-28.0, -18.0]
+  agc_max_gain_db: 24.0
+  uplink_prob: 0.0                  # set >0 if audio is coded before your model sees it
+  uplink_codecs: {opus: 1.0}
+  uplink_bitrate_kbps: [16.0, 32.0]
 
-transport:
-  enabled: true
-  # null means "no codec". Unavailable codecs are dropped automatically at startup.
-  codecs: [null, opus, aac, mp3]
-  codec_weights: [0.30, 0.40, 0.15, 0.15]
-  bitrate_bps: [16000, 64000]
-  clock_drift_ppm: [-100.0, 100.0]   # consumer crystals drift 50-100 ppm
+render:                   # `render`: per-utterance clips
+  mode: paired            # paired | mixed | live | device
+  device_prob: 0.5        # device share in mixed mode
+  tail_ms: 300.0          # reverberant tail kept after the input ends
+
+scene:                    # `scenes`: full-duplex streams with labels
+  duration_s: [10.0, 24.0]
+  types: {both: 0.5, device_only: 0.25, live_only: 0.2, empty: 0.05}
+  live_utterances: [1, 3]
+  live_min_gap_s: 0.4
+  device_gap_s: [0.15, 1.2]         # pauses between programme utterances
+  device_continuous_prob: 0.7       # a TV that was already on, vs a short burst
+  device_voices: [1, 3]             # distinct voices per programme (needs speaker ids)
+  second_device_prob: 0.1
+  save_stems: false
 
 output:
   sr: 16000
-  peak_db: [-3.0, -1.0]
   subtype: PCM_16
-  suffix: .wav
-  # Reverberant tail kept past the end of the input. Without a cap, convolution
-  # adds the whole IR length and stretches every file by up to 1.5 s.
-  tail_ms: 300.0
+  format: wav             # wav | flac - lossless, roughly half the disk space

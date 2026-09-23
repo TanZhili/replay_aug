@@ -1,345 +1,259 @@
 # replay_opus
 
-批量把干净音频（尤其是 TTS 合成的）转换成**「用扬声器在某个环境里播放、再被麦克风重新录下来」**的效果。
+把 TTS 合成的语音渲染成两类训练数据，用来训练全双工语音对话系统的**拒识**能力：
 
-## 为什么不是「加混响」就够了
+- **真人（live）**：一个人在客厅、卧室、厨房或车里，对着设备说出这句话；
+- **外放（device）**：电视、音箱、手机、平板、笔记本、智能音箱、收音机或车机，把同一句话播放出来。
 
-这个项目的结构来自一个反直觉的实验结果。Müller 等人（Interspeech 2025，ReplayDF）把 TTS 音频在
-109 组真实「扬声器 × 麦克风」组合上播放并重录，发现：
+两类放在**同一个场景**里生成：同一个房间、同一组噪声、同一个麦克风、同一条采集链。它们之间唯一的区别是声音是怎么发出来的。
 
-- 给干净 TTS 音频加 15–40 dB 的高斯 / 白 / 粉噪声，检测器准确率几乎不变（−2.3% ~ +3.1%）；
-- 但真实重录一遍，伪造样本的检出率掉 **28–42 个百分点**；
-- 即使用真实 RIR 做卷积增广来训练，EER 也只能从 18.2% 拉回 11.09%（干净基线 4.7%）。
+![同一句 TTS 在同一场景里的真人版与外放版](demo/spectrograms.jpg)
 
-也就是说，真实链路里起作用的成分**既不是噪声，也不只是房间混响**。所以这里实现的是整条物理链路，
-而不是单次卷积：
+## 为什么推倒重来
 
+这个仓库原来的代码是给**深伪 / 重放攻击检测**写的（ASVspoof PA、ReplayDF 那一套）。拿它给全双工拒识造数据，有四个根本问题：
+
+1. **只有一类。** 它只把音频变成「重放音」，没有「真人在同一个房间里说话」的对照。模型能学到的最省事的规则就是「有混响、有噪声、音质差 = 外放」。你已经指出这不够用：真人在客厅里说话，同样有混响和噪声。
+2. **链路的位置不对。** 编解码器放在了麦克风**之后**，这对应的是「偷录的文件又被压缩」。拒识场景里，编解码发生在扬声器**之前**：电视节目是 AAC/AC-3 播出的，短视频是 Opus/AAC，电话是 AMR/G.711。麦克风之后的处理两类都要经过，不该成为区分依据。
+3. **房间不是同一个房间。** 旧代码每条音频独立抽一个 T60/DRR，真人和电视没法放进同一个客厅，也就无从体现「电视在墙边、人在沙发上」这种几何差异。
+4. **没有全双工需要的输出形式。** 全双工模型听到的是一条连续的流：电视一直在说，用户时不时插话，经常和电视重叠。它需要这样的流，并且需要带时间戳的标签。
+
+新架构按「共享场景 + 两条发声链」重写，只保留了原来的 DSP 基础件、编解码往返、扫频测量和路径列表这些可复用的部分。
+
+## 架构
+
+```text
+                ┌─ 真人：嗓音电平 · Lombard 效应 · 嘴部指向性 ───────────────────────────────┐
+TTS 语音 ──────┤                                                                           ├─→ 同一房间 ─→ 同一噪声 ─→ 同一采集链 ─→ 输出
+                └─ 外放：节目链（广播/流媒体/通话/电台）─→ 设备 DSP ─→ 扬声器非线性 ─→ 多单元频响 ┘
+                   （编解码、响度、压缩、配乐、原录音房间）   （对白 EQ、虚拟低音、AVL、智能功放限幅）
 ```
-输入 ──▶ ① 回放侧 ──▶ ② 房间 ──▶ ③ 环境噪声 ──▶ ④ 采集侧 ──▶ ⑤ 传输 ──▶ 输出
-          扬声器 IR      RIR 卷积     底噪 / 自噪声     麦克风 IR      重采样
-          Hammerstein    T60 / DRR    目标 SNR         ADC 削波       时钟漂移
-          非线性 (1–5阶) 控制                          AGC            Opus/AAC/MP3
-          带限 + 软削波
-```
 
-每一级的建模依据、参数范围的文献出处，见 `configs/default.yaml` 里的注释和各模块的 docstring。
+**共享的部分**（`scene.py`、`acoustics.py`、`noise.py`、`capture.py`）：
+
+- **房间**：鞋盒模型。早期反射用镜像源法，每个镜像按倍频程计算墙面吸声、空气吸收（ISO 9613-1）和声源指向性；混合时间之后接扩散尾，尾部电平由同一房间按 Barron 修正理论算出。家具和座椅的散射用散射系数建模：每次反射把一部分镜面能量交给扩散场。所以同一场景里的真人和电视共享 RT60，但各自的直达声、早期反射和直混比取决于自己的位置和朝向。
+- **环境预设**（`environment.py`）：客厅、卧室、厨房、书房、车舱。每种预设给出房间尺寸、混响、麦克风位置、说话人位置、设备类型的比例和噪声工况。车舱有固定座位（主驾、副驾、后排）和车机扬声器布局（门板低音、A 柱高音、后门同轴，可选中置）。
+- **噪声**：以麦克风处的 A 计权声压级给出。家居有安静底噪、空调风扇、电器嗡声、窗外交通；车内有怠速、城市、高速三种工况，由胎噪、发动机阶次、风噪和鼓风机合成。同一场景的噪声对两类完全相同，逐样本一致。
+- **采集链**：MEMS 麦克风频响和自噪声、声压到数字满度的映射、前端高通、AGC、ADC 削波，以及可选的上行编解码。
+
+**不同的部分**，也就是模型真正该学的东西：
+
+| | 真人（`talker.py`） | 外放（`content.py` + `speaker.py`） |
+| --- | --- | --- |
+| 电平 | 1 m 处 55–66 dB(A)，噪声大时按 Lombard 效应抬高并变亮 | 按设备听音音量设定，噪声大时用户会调大音量 |
+| 频带 | 无限制 | 小喇叭高通：手机 400–900 Hz、平板 250–550 Hz、笔记本 180–450 Hz、电视 90–220 Hz；外加谐振峰、腔体峰和箱体起伏 |
+| 节目处理 | 无 | 响度归一（-23/-24 LUFS 或 -12~-18 LUFS）、母带压缩、限幅、配乐、原录音房间 |
+| 编解码 | 无 | AAC / AC-3 / MP2（广播），AAC / Opus / MP3（流媒体），AMR-NB / G.711 / G.722 / Opus（通话） |
+| 非线性 | 无 | 由音量决定：接近最大音量时进入智能功放限幅和振膜非线性 |
+| 辐射 | 一个嘴，高频向前 | 多个单元分处不同位置，可以朝下、朝上、朝墙发声 |
+| 时间结构 | 零星几句 | 连续节目，可能有多个角色轮流说话 |
+
+所有信号都在物理单位（Pa）下渲染，所以真人、设备和噪声之间的相对电平是物理上自洽的。
 
 ## 安装
 
 ```bash
 python -m venv .venv
 .venv/Scripts/python -m pip install -r requirements.txt   # Linux/macOS: .venv/bin/python
-```
-
-`av`（PyAV）自带 ffmpeg，所以 Opus / AAC / MP3 / AMR 编解码**不需要系统装 ffmpeg**。
-`pyroomacoustics` 和 `matplotlib` 是可选的，只有 `room.mode: simulated` 和绘图脚本会用到。
-
-装完先验证一遍：
-
-```bash
 python -m replay_opus selftest
 ```
 
-这条命令会拿解析解已知的系统去验证 IR 合成、扫频测量、编解码往返和整条链路。
+`av`（PyAV）自带 ffmpeg，上面所有编解码器都**不需要**另装系统 ffmpeg。`selftest` 用答案已知的系统逐项验证：BS.1770 响度、A 计权、房间 RT60 与直混比、所有编解码器往返、扫频测量、成对渲染的共享性质、场景标签的位置。
 
-## 输入是路径列表，不是文件夹
+## 输入：一行一条语音
 
-`simulate` 读到的每一类素材都是一个文本文件，一行一个路径：
-
-| 材料 | 命令行 | 配置项 | 允许的后缀 |
-| --- | --- | --- | --- |
-| 干净音频 / TTS | `--input` | — | `.wav .flac .ogg .mp3 .m4a .opus` |
-| 房间 IR | `--room-ir-list` | `room.ir_list` | `.wav .flac .ogg .aiff .aif` |
-| 噪声 / 房间静音 | `--noise-list` | `noise.noise_list` | `.wav .flac .ogg` |
-| 麦克风 IR | `--mic-ir-list` | `capture.mic_ir_list` | 同房间 IR |
-| 实测扬声器模型 | `--speaker-model-list` | `playback.model_list` | `.npz` |
-
-空行和 `#` 注释会跳过，两端的引号会去掉。相对路径相对于**列表文件所在的目录**，重复路径只保留第一次。文件不存在，或者后缀不在上表里，会直接报错而不是静默跳过。编码接受 UTF-8、带 BOM 的 UTF-8，以及 PowerShell 重定向常见的 UTF-16。
-
-输出文件名和抽样用的 key，都是列表里各路径相对于它们公共父目录的相对路径。列表最好落在同一棵目录下：加进一个公共父目录之外的文件，会把已有条目的相对路径一起改掉，同一条语音的抽样就对不上了。
-
-仓库里的 `demo/` 只留了 10 个音频，避免把示例目录当成语料库。分别是 `source.wav`、`source_batch/` 里的 5 条、`sweep.wav`、`recorded_sweep.wav`、`irs/livingroom_test.wav` 和一条重放结果 `replayed_v0.wav`。对应的列表是 `demo/inputs.txt`、`demo/irs.txt`、`demo/speakers.txt`。
-
-## 三种用法
-
-### 路线 A：零硬件，直接跑
-
-不需要任何下载，房间用参数化合成 IR：
-
-```bash
-python -m replay_opus simulate \
-  --input  demo/inputs.txt \
-  --output path/to/replayed \
-  --config configs/default.yaml \
-  --variants 3 --workers 8
-```
-
-`--output` 仍然是目录。里面会有一份 `manifest.jsonl`，逐条记录该文件实际抽到的每一个条件
-（扬声器等级、驱动电平、实测 T60/DRR/C50、SNR、麦克风参数、AGC 增益范围、削波比例、时钟漂移、
-编解码与码率）。这份元数据是后续做分层评测和排查问题的唯一依据。
-
-吞吐参考：8 进程下约 **40× 实时**（在一台普通开发机上实测 300 s 音频耗时 7.6 s），
-所以 1000 小时素材约 25 小时可以跑完，进程数再加还能线性提升。
-
-### 路线 A+：接上公开 IR 库
-
-有了真实 IR 之后保真度会明显提升。先把要用的 IR 写进列表，再用 `ir-stats` 看这批 IR 的分布：
-
-```bash
-python -m replay_opus ir-stats --ir-list demo/irs.txt --output real.jsonl
-python -m replay_opus simulate \
-  --input demo/inputs.txt --output out \
-  --room-ir-list demo/irs.txt
-```
-
-`--room-ir-list` 默认启用 `reshaped` 模式：每次卷积前把 IR 重定向到抽样得到的 T60/DRR，
-这样 N 条实测 IR 能派生出远多于 N 种声学条件（Luong 等人 SLT 2024 用这个方法把 270 条 MIT IR
-扩成了 500 倍）。要原样使用 IR 就加 `--room-mode measured`。
-
-推荐的 IR 来源：
-
-| 来源 | 内容 | 许可 |
-| --- | --- | --- |
-| [ReplayDF](https://huggingface.co/datasets/mueller91/ReplayDF) | 109 条**端到端重放链路** IR（已含扬声器+房间+麦克风） | 仅非商用研究 |
-| [OpenSLR SLR28](https://openslr.org/28) | 实测 + 仿真 RIR，附 MUSAN 点源噪声 | Apache 2.0 |
-| [MIT IR Survey](https://mcdermottlab.mit.edu/Reverb/IR_Survey.html) | 271 条日常真实环境 IR | 免费 |
-| [BUT ReverbDB](http://merlin.fit.vutbr.cz/ReverbDB/) | RIR **加上同条件的底噪录音** | 开放 |
-| [POLIPHONE](https://github.com/polimi-ispl/POLIPHONE) | 20 款手机的**麦克风** IR | 研究用 |
-
-把 BUT ReverbDB 的 silence 或 MUSAN 噪声写进一个列表，用 `--noise-list`（或 `noise.noise_list`）配上；
-把 POLIPHONE 的麦克风 IR 写进另一个列表，用 `--mic-ir-list`（或 `capture.mic_ir_list`）配上。
-这比内置的合成底噪和合成麦克风频响真实得多。
-
-### 路线 B：测自己的链路（保真度最高）
-
-每个「扬声器 × 房间 × 距离 × 麦克风」配置只需要放**一次扫频**，就能同时得到整条链路的线性 IR
-和它的谐波失真剖面。
-
-```bash
-# 1. 生成扫频信号（12 s，50 Hz–20 kHz，前后各留 2 s 静音）
-python -m replay_opus sweep --output sweep.wav
-
-# 2. 用目标扫声器播放 sweep.wav，用目标麦克风录下来，两端增益保持固定不变。
-#    录音要保留开头的静音段。
-
-# 3. 提取
-python -m replay_opus extract --recording recorded.wav --output irs/ --name livingroom_jbl_iphone
-```
-
-这会产出三个文件：`.wav`（可直接拿去卷积的链路 IR）、`.npz`（扬声器模型）、`.json`（T60 / DRR /
-C50 与谐波电平报告）。把 `.wav` 写进一个列表交给 `--room-ir-list`，把 `.npz` 写进另一个列表交给
-`--speaker-model-list`（或 `playback.model_list`），就是在用你自己测的链路做批量生成：
-
-```bash
-python -m replay_opus simulate \
-  --input demo/inputs.txt --output out \
-  --room-ir-list demo/irs.txt --room-mode measured \
-  --speaker-model-list demo/speakers.txt
-```
-
-20–50 个配置足以建出一个可用的库，每个配置大约 2 分钟。这也是 ASVspoof 2019 PA 和 RIRplay
-（TIFS 2026）采用的做法。
-
-### 路线 C：真实播放 + 重录
-
-这个项目不做这件事，但**建议你留一小份**真实重录的评测集。ASVspoof 2021 PA 已经证明，
-只在仿真数据上训练的模型对真实重放的泛化会明显掉一档。
-
-## 读 ir-stats
-
-`ir-stats` 按 `metrics.py` 里和 ASVspoof PA、ACE Challenge 对齐的定义，给列表中每一条 IR 算四个数。
-读入时会切掉直达声之前的空白，并把尾巴截到 1500 ms（和链路里的 `room.ir_max_ms` 相同）。
-
-| 字段 | 含义 |
-| --- | --- |
-| `t60_s` | T60，单位秒。取 Schroeder 能量衰减曲线上 −5 dB 到 −35 dB 这一段的斜率，外推到 −60 dB（也就是 T30）。不是 Sabine 公式，也不是分频带 T60。 |
-| `drr_db` | DRR，单位 dB。直达声取峰值前后各 **2.5 ms**，其余算晚到能量，再取两者能量比。窗很窄：车内几毫秒就到的早反射会算进直达，所以车内的 DRR 偏高。 |
-| `c50_db` | C50，单位 dB。直达之后 **50 ms** 以内的能量，比上 50 ms 以后的能量。语音清晰度常用这个窗。它和 DRR 相关，但不是同一个数。 |
-| `length_ms` | 对齐、截断之后的 IR 长度。顶在 1500 附近说明尾巴被切掉了，厅堂的 T60 会被低估。 |
-
-标准输出先报总数，再报「可用」子集的最小值、中位数、最大值。可用的判定和 Luong 等人（SLT 2024）一样：T60 ≤ 2 s，并且 DRR 在 −10 到 30 dB。超出这个范围的 IR、以及 T60/DRR 算出来是 NaN 的 IR，不进这三行汇总。`--output` 写成 JSONL 时仍然逐条保留全部记录；读失败的文件只有 `ir` 和 `error`。
-
-`demo/irs.txt` 只有一条客厅 IR，实际输出是：
+输入是一个文本文件，一行一条，不是文件夹：
 
 ```text
-1 impulse responses, 1 within usable T60/DRR bounds
-  t60_s    min=  0.491 median=  0.491 max=  0.491
-  drr_db   min=  2.210 median=  2.210 max=  2.210
-  c50_db   min= 11.910 median= 11.910 max= 11.910
+tts/zh_000.wav	帮我把客厅的灯关掉。
+tts/spk03_0012.wav	spk03	今天北京的天气怎么样？
+tts/zh_009.wav
 ```
+
+每行可以是 `路径`、`路径<TAB>文本` 或 `路径<TAB>说话人<TAB>文本`，也可以用 `.jsonl`，每行写 `{"audio": ..., "text": ..., "speaker": ...}`。相对路径相对于列表文件所在的目录。文本和说话人会原样写进标签。编码接受 UTF-8、带 BOM 的 UTF-8 和 UTF-16。
+
+`demo/inputs.txt` 是 12 条真实 TTS（Windows 自带的 Huihui / Zira 语音，由 `scripts/make_demo_tts.ps1` 生成），其中既有助手指令也有新闻、剧集、广告式的句子。两类数据来自同一个语音池，所以句子内容本身不会决定标签。
+
+## 用法一：`render`，逐句成对
+
+```bash
+python -m replay_opus render --input demo/inputs.txt --output out/pairs --variants 4 --workers 8
+```
+
+每条语音、每个 variant 抽一个场景，把同一句话往里渲染两遍：
+
+```text
+out/pairs/live/zh_000__v0.wav      真人版
+out/pairs/device/zh_000__v0.wav    外放版（同一房间、同一噪声、同一麦克风）
+out/pairs/manifest.jsonl           每个文件一行
+```
+
+manifest 的主要字段：
+
+| 字段 | 内容 |
+| --- | --- |
+| `label` | `live` 或 `device` |
+| `pair` | 成对 ID：`key#variant`，两类共用 |
+| `text` / `speaker` | 从输入列表带过来 |
+| `at_mic` | 麦克风处的语音 A 计权电平、信噪比、直达声延迟 |
+| `scene` | 环境、房间尺寸与分频带 RT60、麦克风位置、噪声工况与电平、采集链参数 |
+| `source` | 真人：电平、Lombard、朝向、距离；设备：类型、各单元位置与频响、DSP 设置、节目链（响度、压缩、编解码、配乐） |
+
+`--mode` 可以是 `paired`（默认，两类都出）、`mixed`（每个 variant 按 `render.device_prob` 只出一类）、`live` 或 `device`。
+
+吞吐：单进程成对模式约 18 倍实时。这台机器上 8 进程渲染 480 条（约 29 分钟音频）用时 19 秒，约 90 倍实时。
+
+## 用法二：`scenes`，全双工流加时间标签
+
+```bash
+python -m replay_opus scenes --input demo/inputs.txt --output out/scenes --count 1000 --workers 8
+```
+
+每个场景是一条 10–24 秒的流。可能有一台设备在播节目（「电视本来就开着」的连续节目，或一段短视频式的突发），也可能有用户零星说一到三句，并且经常和设备的声音重叠：
+
+![全双工场景：智能音箱在播一通窄带电话，用户从 11 秒起插话](demo/scene.jpg)
+
+manifest 每行一个场景，标签有两层，时间都是语音**到达麦克风**的时刻：
+
+- `utterances`：每条放进场景的语音一项，带角色、声源、设备、节目类型、文本和说话人；
+- `segments`：这些语音内部的语音活动段。一句 TTS 如果中间停顿较长，会分成几段，每段用 `utterance` 指回它所属的那一句，不重复文本。
+
+下面是 `demo/scenes` 里上图那个场景的实际输出（节选）：
 
 ```json
-{"ir": "livingroom_test.wav", "t60_s": 0.491, "drr_db": 2.21, "c50_db": 11.91, "length_ms": 826.4}
+{"audio": "scenes/scene_000002.wav", "scene_type": "both", "duration_s": 19.049,
+ "utterances": [
+   {"start": 7.08, "end": 9.39, "role": "device", "source": "device0", "device": "smart_speaker",
+    "content": "phone_call", "utt": "zh_004.wav", "text": "把空调温度调到二十六度。", "speaker": null},
+   {"start": 10.929, "end": 17.289, "role": "live", "source": "live0",
+    "utt": "zh_007.wav", "text": "据气象部门预报，明天白天有小到中雨，请大家出行注意安全。", "speaker": null}
+ ],
+ "segments": [
+   {"start": 10.929, "end": 12.459, "role": "live", "source": "live0", "utterance": 2},
+   {"start": 10.984, "end": 13.294, "role": "device", "source": "device0", "utterance": 3},
+   {"start": 12.879, "end": 14.879, "role": "live", "source": "live0", "utterance": 2}
+ ],
+ "sources": {"device0": {...}, "live0": {...}}, "scene": {...}}
 ```
 
-`ir` 是该文件相对于列表公共父目录的路径。同一条 IR 的 `extract` 报告写的是 DRR 2.7 dB、长度 1500 ms：
-`ir-stats` 读入时会切掉直达声之前的空白再做能量归一，所以 DRR 和 `length_ms` 会和那份报告差一截。
-这条的 `length_ms` 是 826，没有顶到 1500，说明尾巴没有被截断。
+场景类型按权重抽取：`both` 0.5、`device_only` 0.25、`live_only` 0.2、`empty` 0.05，可以在 `scene.types` 里改。如果输入列表带了说话人，同一场景里用户的声音不会和节目里任何一个角色相同，但每个说话人在整个数据集里两种角色都会出现。`--stems` 会额外写出每个声源在麦克风处的分轨（按混音同样的增益，但在 AGC、削波和上行编解码之前）。要把 `segments` 转成帧级标签：
 
-### 不同场景下这三个量大概落在哪
+```python
+from replay_opus import frame_labels
+labels = frame_labels(record["segments"], record["duration_s"], frame_s=0.02)
+# 0 = 无语音，1 = 仅真人，2 = 仅外放，3 = 重叠
+```
 
-下表是按上面这套定义、做宽带估计时的典型区间，不是某一个语料的官方标注。同一个房间里把麦克风拉远，T60 差不多，DRR 和 C50 会掉。距离按「人声到麦克风」理解。
+## 防捷径设计
 
-| 场景 | T60 (s) | DRR (dB) | C50 (dB) |
-| --- | --- | --- | --- |
-| 车内座舱，约 0.4–0.8 m | 0.05–0.15 | +6 – +18 | +10 – +25 |
-| 卧室、书房，有软装，约 1 m | 0.20–0.50 | +2 – +12 | +5 – +16 |
-| 客厅，约 1–2 m | 0.35–0.80 | −2 – +10 | 0 – +12 |
-| 厨房、卫生间等硬表面小房间 | 0.60–1.50 | −6 – +6 | −3 – +8 |
-| 办公室、小会议室，1–3 m | 0.40–1.00 | −5 – +8 | −2 – +10 |
-| 教室、走廊 | 0.60–1.50 | −8 – +4 | −5 – +6 |
-| 礼堂、体育馆、楼梯间 | 1.5–4 以上 | −12 – 0 | −8 – +2 |
-| 户外空旷，近处对话 | 通常 < 0.10，或测不出来 | +15 – +30 | +15 – +30 |
-| 户外半封闭（街巷、廊下、庭院） | 0.15–0.80 | 0 – +15 | +2 – +18 |
+拒识模型会学训练集里最便宜的区分特征。这里刻意让下面这些**不能**用来区分两类：
 
-读的时候有三件事：
+- **内容和音色**：两类来自同一个 TTS 语音池；成对模式下连句子都相同。
+- **房间、噪声、麦克风、前端**：同一场景共享，噪声逐样本一致。
+- **电平**：设备音量和人声电平的分布是按麦克风处的实际声压校准过的。车舱会额外带来约 7 dB 的混响增益，车机的电平已经把这一点算进去了。
+- **时长和起始静音**：成对的两个文件等长。
 
-- 默认配置 `room.t60_s: [0.08, 0.90]`、`room.drr_db: [-3, 20]` 覆盖的是客厅和办公室的主体。车内极短混响的下沿、户外极高的 DRR、厅堂 1 s 以上的长尾都不在这个区间里。要做这些场景就改这两个范围。`reshaped` 只能把一条 IR 的 T60 **缩短**，拉不长，长尾要用 `room.mode: synthetic`。
-- 户外空旷没有一段指数衰减的混响尾。T60 经常很小，或者因为衰减曲线不成立而变成 NaN，这种记录不会进汇总。这时 DRR、C50 很高，只说明几乎没有晚到的反射，不要把它读成「一个 T60 = 0.05 s 的小房间」。
-- `ir-stats` 不报告信噪比。SNR 是噪声级的参数，`noise.snr_db` 默认在 12–40 dB 之间抽，和 IR 无关。
+同时保留了难例：条形音箱和智能音箱近距离播放（难负例）、远处背对设备的用户、70 dB(A) 车噪下的用户（难正例）。
 
-## 造训练数据时的一个关键注意点
-
-如果你只对伪造音频做重放处理、真实音频保持干净，模型会直接学到「音质差 = 假」这个捷径。
-ReplayDF 明确观察到：在真假录音条件本身就有差异的数据上训练的模型，会把整个 ReplayDF
-（含真实样本）都判成伪造。
-
-**所以真假两侧要过同一条链**，用同一个配置、不同的 `--seed` 跑两遍即可：
+`audit` 命令逐个特征检查有没有漏网的捷径。它计算每个简单特征单独区分两类的 AUC（0.5 表示没有信息）：
 
 ```bash
-python -m replay_opus simulate --input bonafide.txt --output out/bonafide --seed 11
-python -m replay_opus simulate --input spoof.txt    --output out/spoof    --seed 22
+python -m replay_opus audit --manifest out/pairs/manifest.jsonl
 ```
 
-## 验证仿真是否够真
+默认配置下 12 条语音 × 20 个场景（480 个文件）的实测结果：
 
-三层，从便宜到贵：
-
-1. **声学层** —— `scripts/plot_manifest.py` 把生成批次的 (T60, DRR) 覆盖、SNR 分布和编解码构成
-   画出来，可以叠加一份参考分布对比：
-
-   ```bash
-   python -m replay_opus ir-stats --ir-list real_irs.txt --output real.jsonl
-   python scripts/plot_manifest.py out/manifest.jsonl --reference real.jsonl
-   ```
-
-   仿真集的 (T60, DRR) 散点应该覆盖并大致重合真实集，而不是缩在角落里。
-
-2. **感知层** —— 对照原始音频算 PESQ，再做小规模 MOS 听测。ReplayDF 的真实重录覆盖 MOS/PESQ
-   从 <2（很脏）到 >4（很干净）的全谱；你的仿真集也应该铺满这个区间。
-
-3. **下游层** —— 用仿真集训练的检测器在**真实重录留出集**上的 EER。这是唯一真正说明问题的指标。
-   参照系：ASVspoof 2019 训练 → 2021 PA 评测 EER 36.89%；RIRplay 训练 → 28.04%。
-
-## 用重放检测器验收：只看一个分数没有用
-
-先说清楚这件事为什么不能省事。上面这些检测器的训练目标几乎都是「干净近讲」对「真实重录」。
-只加了混响的音频同样不是近讲，所以也会被判成重放。**拿一段生成音频去跑检测器、得到一个高分，
-只说明它不像近讲，不能说明整条链路仿真得像。** 也没有哪个公开模型是专门拿「真实重录」对「只加混响」
-训练的，所以没有单个分数能直接回答「是不是只有混响」。
-
-能回答这个问题的是对照实验：同一批源音频过三个条件，看检测器被推动了多远，再和真实重录比。
-`configs/ablation_*.yaml` 就是这组对照，三个文件除了开哪些阶段之外完全一致
-（同 seed、同输出采样率、同归一化、`tail_ms: 0` 让三者时长严格相等——否则按固定窗长切片的检测器
-会把长度差异当成条件差异）：
-
-| 条件 | 配置 | 开了什么 |
-| --- | --- | --- |
-| A 干净 | `configs/ablation_clean.yaml` | 只重采样和归一化，作对照基线 |
-| B 只加混响 | `configs/ablation_room_only.yaml` | 只开房间卷积，等价于普通 RIR 增广 |
-| C 整条链路 | `configs/ablation_full_chain.yaml` | 回放、房间、噪声、采集、传输全开 |
-
-```powershell
-foreach ($c in 'ablation_clean','ablation_room_only','ablation_full_chain') {
-  python -m replay_opus simulate --input eval.txt --output out/$c --config configs/$c.yaml
-}
+```text
+feature             kind          AUC        live      device
+level_dbfs          nuisance    0.553     -33.740     -32.304
+peak_dbfs           nuisance    0.466     -14.669     -15.244
+duration_s          nuisance    0.500       3.625       3.625
+noise_floor_dbfs    nuisance    0.510     -54.864     -52.953
+crest_db            acoustic    0.257      19.093      16.393
+...
+level AUC by environment: bedroom 0.56, car_cabin 0.56, kitchen 0.55, living_room 0.54, study 0.56
+paired level difference device - live: mean +1.0 dB, sd 4.8, 10-90% [-4.6, +7.9]
 ```
 
-判据是 **C 要比 B 明显更靠近真实重录**。如果 C 和 B 打成平手，那多出来的四个阶段没起作用，
-这条链路确实就只是混响。
+电平、峰值、时长、底噪这几个「无关特征」都在 0.5 附近，每个环境内部也是。波峰因数偏低（AUC 0.26）是物理上应有的差异：节目压缩和功放限幅会压低峰值。简单的全局频带比几乎分不开两类，因为噪声、麦克风低频滚降和前端高通在两类上一视同仁地抹掉了低频。模型要学的线索比全局频带比细得多。改了预设之后要重新跑一次 `audit`；`scripts/plot_manifest.py` 可以把两类的电平、信噪比、距离分布叠起来画出来。
 
-### 用哪个检测器
+## 配置
 
-| 模型 | 训的什么 | 权重 | 适用 |
-| --- | --- | --- | --- |
-| [W2V2-AASIST](https://huggingface.co/SpeechAntiSpoofingBenchmarks/W2V2-AASIST) | ASVspoof 2019 LA 深伪 | 有，[HF 上自带推理封装](https://huggingface.co/SpeechAntiSpoofingBenchmarks/W2V2-AASIST)，另需 `xlsr2_300m.pt` | **首选**：ReplayDF 用的就是它，有可对照的公开数字 |
-| [ASVspoof 2021 PA LFCC-LCNN](https://github.com/asvspoof-challenge/2021/tree/main/PA/Baseline-LFCC-LCNN) | ASVspoof 2019 **PA**，真·重放 | 官方预训练，仓库里是 `__pretrained/` 占位，按 README 下载 | 唯一现成的重放专用预训练权重 |
-| [AASIST](https://github.com/clovaai/aasist) / [RawNet2](https://github.com/TakHemlata/SSL_Anti-spoofing) | ASVspoof 2019 LA | 有 | 轻量对照，`AASIST.pth` 是 LA 不是 PA |
-| [EchoFake](https://github.com/EchoFake/EchoFake) 基线 | EchoFake（含真实重放，ICASSP 2026） | 无，需自己训 | 最贴近这个任务，但要先训 |
-| [M-ALRAD](https://arxiv.org/abs/2502.13473) | ReMASC 多通道 | 见论文 | ReMASC 上 SOTA，但要麦克风阵列，本仓库输出单通道用不上 |
-
-首选 W2V2-AASIST 的原因是它给了**可对照的目标数字**。ReplayDF（Interspeech 2025）把同一批音频
-真实重录一遍，量到：公开权重的 EER 从 10.6% 涨到 24.8%；在 ODSS 上重训后从 4.7% 涨到 18.2%，
-即使训练时用 ReplayDF 的 RIR 做增广也只能压回 11.09%。还有一个更细的特征：air-gap **只影响伪造样本**，
-伪造侧准确率掉 28–42 个百分点，真实样本那一侧基本不动（98.3% → 97.7%）。
-你的 C 条件如果也呈现这个不对称，比总 EER 涨了多少更能说明问题。
-
-### 把分数变成结论
-
-每个条件导出一个打分文件，一行一条 `路径<TAB>标签<TAB>分数`，标签是 `bonafide` 或 `spoof`，
-分数默认越大越像真实（上面几个权重都是这个约定，反过来就加 `--higher-is-spoof`）：
+`configs/default.yaml` 就是全部内置默认值，每一项都有注释。环境、设备、节目链这三张预设表写在代码里，用下面的命令打印当前生效的版本：
 
 ```bash
-python scripts/detector_report.py \
-  --scores clean=scores_A.txt \
-  --scores room=scores_B.txt \
-  --scores chain=scores_C.txt \
-  --scores real=scores_replaydf.txt \
-  --baseline clean --reference real --threshold 0.0
+python -m replay_opus presets --section devices
 ```
 
-输出每个条件的 EER、相对基线的变化，以及 **gap closed**——这个条件复现了多少「干净 → 真实重录」
-的 EER 差距。B 通常只能吃掉一部分，C 应该明显更高。加上 `--threshold` 还会分别报真实侧和伪造侧的
-准确率，用来核对上面那个不对称特征。
+YAML 里只需要写要改的东西，预设会做深合并；任何一项也都可以在命令行用 `--set` 临时覆盖：
 
-真实重录那一列（`--reference`）建议直接用 [ReplayDF](https://huggingface.co/datasets/mueller91/ReplayDF)：
-它公开了重录音频，而且原始未重录的音频来自 MLAAD v5 和 M-AILABS，可以拿同一批源音频过你的链路，
-构成严格配对的对照。没有这一列时脚本仍然能跑，只是只能看 B 和 C 的相对关系，没有上界参照。
+```yaml
+environments: {car_cabin: 1.0}                 # 只要车舱
+environment_presets:
+  car_cabin: {drive_side: right}               # 右舵
+devices:
+  presets:
+    tv: {level_dba: [60.0, 72.0]}              # 电视开得更响
+content:
+  profiles:
+    streaming: {bed_prob: 0.8}                 # 流媒体更常带配乐
+```
 
-## 已验证的行为
+```bash
+python -m replay_opus render --input in.txt --output out --config my.yaml --set capture.agc_prob=0
+```
 
-`python -m replay_opus selftest` 和 `python -m pytest tests -q`（37 项）覆盖：
+采样率：内部默认 32 kHz 处理，输出 16 kHz。如果模型吃 24 kHz（例如 Mimi 系编解码器），设 `sr_internal: 48000` 和 `output.sr: 24000`。数据量大时可以设 `output.format: flac`，无损，磁盘占用约为 WAV 的一半。
 
-| 检查项 | 判据 | 实测 |
+## 接入真实素材（强烈建议）
+
+合成素材让流程开箱即用，真实素材会明显提高逼真度。每一类都用路径列表接入：
+
+| 素材 | 配置项 | 说明 |
 | --- | --- | --- |
-| 合成 IR 命中目标 T60 / DRR | T60 误差 <10%，DRR <0.5 dB | T60 <2%，DRR <0.01 dB |
-| IR 重定向（Bryan 方法） | 同上 | T60 <2%，DRR <0.01 dB |
-| 扫频恢复房间 IR | T60 误差 <0.02 s | 小数点后三位一致 |
-| 用测得 IR 卷积复现系统 | 残差 < −30 dB | −57.9 dB |
-| 已知多项式的谐波剖面 | 误差 <0.2 dB | <0.01 dB |
-| 编解码往返 | 保长度、增益 0.9–1.1、延迟已补偿 | 全部通过 |
-| 同种子可复现 | 逐比特一致 | 通过 |
-| AGC 不把静音段抬到语音之上 | 静音低于语音 >20 dB | 通过 |
-| 输出时长受控 | 输入时长 + `tail_ms` | 通过 |
+| 环境噪声 | `noise.lists: {home: ..., car: ...}` | 家居、车内的真实底噪录音。电平仍按场景抽取 |
+| 配乐 / 音效 | `content.bed_list` | 电视剧、短视频里的人声常压在音乐下面。可用 MUSAN music 之类的音乐库 |
+| 实测房间 IR | `room.measured: {living_room: ...}` | 每个子目录算一个房间；同一场景的真人和各个扬声器单元会从同一个房间的不同位置里抽 IR |
+| 麦克风频响 | `capture.mic_ir_list` | 你的目标设备或 POLIPHONE 之类的手机麦克风 IR |
+| 实测设备频响 | `devices.measured: {tv: ...}` | 用 `sweep` / `extract` 在设备前 10–30 cm 测得，加载时自动截取前几毫秒以去掉测量房间 |
+
+测自己的电视或手机：
+
+```bash
+python -m replay_opus sweep --output sweep.wav          # 用目标设备播放，在正前方 10-30 cm 录音
+python -m replay_opus extract --recording rec.wav --output responses/ --name living_tv
+```
+
+`extract` 会写出 `living_tv.npz`，把它写进一个列表交给 `devices.measured.tv` 即可。报告里的 `thd_at_sweep_level` 可以拿来核对对应预设的 `thd_full_scale` 范围。
+
+## 验证
+
+- `python -m replay_opus selftest`：安装后的快速自检。
+- `python -m pytest tests -q`：101 项测试，检查的都是物理规律和两类之间的不变量，而不是快照。主要包括：各倍频程 RT60 符合 Eyring 公式（误差在 12% 以内，实测约 5%），直混比随距离的变化符合扩散场理论（2 dB 以内），指向性只改变直达声不改变混响尾，设备输出电平校准到目标值（0.05 dB 以内），失真随音量增大，窄带通话 4.5 kHz 以上能量低于 -35 dB，成对渲染在语音到来之前逐样本一致，场景标签内外的能量差大于 10 dB，`configs/default.yaml` 与代码默认值一致。
+- **下游验证只有一条路**：留一小份**真实录制**的评测集，在你目标的真实家庭和车里，分别录真人说话和真实电视、手机的外放。仿真训出的模型在这份集合上的表现，才是唯一能说明问题的指标。公开数据里，ReMASC 录了室内、户外和车内环境下的真人与重放语音，可以作为参照。
 
 ## 已知局限
 
-- **高阶 Hammerstein 核的频率响应没有精确辨识。** `measure` 会精确测出各阶谐波**相对电平**
-  （对已知多项式系统误差 <0.01 dB），并用这个斜率去标定合成核；但每一阶自己的频响需要完整的
-  Novak 核反演，这里没有做。实践上影响不大——ReplayDF 和 Luong 的结果都表明卷积成分占主导。
-- **测得的 T60 / DRR 是带限量。** 扫频测量得到的是真 IR 与带限冲激的卷积，所以 DRR 的 ±2.5 ms
-  直达窗在低频处会被涂抹。ACE 之类的语料用分频带统计正是因为这个。
-- **`reshape_ir` 只能缩短 T60**，不能拉长——拉长等于凭空编造一段没被录下来的混响尾巴。
-  需要长尾就用 `room.mode: synthetic`。
-- **AGC / 降噪是简化模型。** 真实手机和会议软件跑的是 WebRTC APM（高通 → AEC → 降噪 → AGC2）。
-  需要逐比特一致就换 `pywebrtc-audio` 绑定。
-- **没有建模 AEC**、也没有建模二次重放（「偷录再重放」需要两段串联卷积）。
+- **单通道。** 输出单个麦克风的信号。如果前端是麦克风阵列加波束形成，空间线索（声源方向稳定、多单元的空间扩展）只能部分体现。
+- **鞋盒近似。** 车舱和房间都按长方体计算，低频模态、桌面反射、座椅遮挡没有单独建模，只由散射系数和吸声分布近似。有实测房间 IR 时优先用实测。
+- **设备是参数模型。** 频响、失真、DSP 都按设备类型的典型范围随机抽取，指向性用心形族近似。要逼近某款具体产品，就测它的频响。
+- **没有建模回声。** 全双工系统自己播放的声音（AEC 残留）没有包含在内，那需要另外的数据。
+- **没有其他真人。** 家里其他人之间的对话同样是「真人」，从声学上无法拒识，需要语义或说话对象判断。
+- **只有 TTS 声音。** 模型在训练里没听过真人嗓音。如果有真实语音语料，建议把它加进同一个语音池，两类一起用。
+- **Lombard 效应只建模了电平和频谱倾斜**，没有建模基频和语速的变化。
 
 ## 主要参考
 
-- N. Müller et al., *Replay Attacks Against Audio Deepfake Detection*, Interspeech 2025.
-  [arXiv:2505.14862](https://arxiv.org/abs/2505.14862)
-- H.-T. Luong, D.-T. Truong, K. A. Lee, E. S. Chng, *Room Impulse Responses Help Attackers to
-  Evade Deep Fake Detection*, IEEE SLT 2024. [arXiv:2409.14712](https://arxiv.org/abs/2409.14712)
-- J. C. Sanchez-Valera et al., *RIRplay: Generation of a Replay Stereo Corpus for Voice Biometrics
-  Anti-Spoofing*, IEEE TIFS 21:4106–4118, 2026.
-- X. Wang et al., *ASVspoof 2019: A Large-Scale Public Database of Synthesized, Converted and
-  Replayed Speech*, Computer Speech & Language, 2020. [arXiv:1911.01601](https://arxiv.org/abs/1911.01601)
-- J. Yamagishi et al., *ASVspoof 2021: Towards Spoofed and Deepfake Speech Detection in the Wild*,
-  IEEE/ACM TASLP, 2023. [arXiv:2210.02437](https://arxiv.org/abs/2210.02437)
-- A. Novak, P. Lotton, L. Simon, *Synchronized Swept-Sine: Theory, Application and Implementation*,
-  JAES 63(10):786–798, 2015.
-- N. J. Bryan, *Impulse Response Data Augmentation and Deep Neural Networks for Blind Room
-  Acoustic Parameter Estimation*, ICASSP 2020.
-- H. Tak et al., *RawBoost: A Raw Data Boosting and Augmentation Method Applied to ASV
-  Anti-Spoofing*, ICASSP 2022.
+- J. B. Allen, D. A. Berkley, *Image method for efficiently simulating small-room acoustics*, JASA 65(4), 1979.
+- M. Barron, L.-J. Lee, *Energy relations in concert auditoriums. I*, JASA 84(2), 1988.
+- A. Lindau, L. Kosanke, S. Weinzierl, *Perceptual evaluation of model- and signal-based predictors of the mixing time in binaural room impulse responses*, JAES 60(11), 2012.
+- ISO 9613-1, *Attenuation of sound during propagation outdoors — Part 1: Calculation of the absorption of sound by the atmosphere*.
+- ITU-R BS.1770-4, *Algorithms to measure audio programme loudness and true-peak audio level*；EBU R 128；ATSC A/85.
+- ANSI S3.5-1997 / ISO 9921：不同发声力度下的语音声压级。
+- H. Lane, B. Tranel, *The Lombard sign and the role of hearing in speech*, J. Speech Hear. Res. 14, 1971.
+- W. T. Chu, A. C. C. Warnock, *Detailed directivity of sound fields around human talkers*, NRC IRC-RR-104, 2002.
+- W. Klippel, *Tutorial: Loudspeaker nonlinearities — causes, parameters, symptoms*, JAES 54(10), 2006.
+- E. Larsen, R. M. Aarts, *Reproducing low-pitched signals through small loudspeakers*, JAES 50(3), 2002.
+- A. Novak, P. Lotton, L. Simon, *Synchronized Swept-Sine: Theory, Application and Implementation*, JAES 63(10), 2015.
+- M. E. Ahmed et al., *Void: A fast and light voice liveness detection system*, USENIX Security 2020.
+- Y. Gong et al., *ReMASC: Realistic Replay Attack Corpus for Voice Controlled Systems*, Interspeech 2019.

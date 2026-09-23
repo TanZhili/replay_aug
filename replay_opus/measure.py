@@ -1,11 +1,16 @@
-"""Synchronised swept-sine measurement of a real playback -> room -> capture chain.
+"""Synchronised swept-sine measurement of a real playback device.
 
-Play the generated sweep through the loudspeaker you want to model, record it with
-the microphone you want to model, and one pass yields both:
+Play the generated sweep through the TV, phone or car system you want to model and
+record it with a reasonably flat microphone. Placed close to the device (10-30 cm,
+on axis), one pass yields:
 
-* the linear impulse response of the whole chain (speaker + room + mic), and
-* the harmonic distortion profile of that chain, which calibrates the non-linear
-  part of :mod:`replay_opus.speaker`.
+* the linear impulse response of the device - gated to its first milliseconds on
+  loading, which keeps driver and cabinet and drops the room it was measured in;
+* its harmonic distortion profile, to compare against the ``thd_full_scale`` range
+  of the matching preset in :mod:`replay_opus.speaker`.
+
+The scene supplies the room, so list the resulting files under ``devices.measured``
+rather than as room IRs.
 
 Method: Novak, Lotton & Simon, "Synchronized Swept-Sine: Theory, Application and
 Implementation", JAES 63(10), 2015. Harmonic impulse responses separate in time at
@@ -25,7 +30,6 @@ import numpy as np
 from scipy import signal
 
 from .dsp import EPS, butter
-from .speaker import SpeakerModel
 
 HANN_COHERENT_GAIN = 0.5
 
@@ -248,11 +252,7 @@ def harmonic_profile(
 
 
 def calibrate_harmonic_rolloff(profile: dict) -> float:
-    """Fit one dB-per-order slope to a measured harmonic profile.
-
-    Feed the result to :func:`replay_opus.speaker.synth_speaker_kernels` via a custom
-    preset so the simulated device distorts like the one you measured.
-    """
+    """Fit one dB-per-order slope to a measured harmonic profile."""
     orders = np.asarray(profile["orders"], dtype=float)
     levels = np.asarray(profile["level_db"], dtype=float)
     keep = orders > 1
@@ -268,29 +268,23 @@ def measure_chain(
     orders: list[int] | None = None,
     ir_ms: float = 1500.0,
     window: int = 8192,
-) -> tuple[np.ndarray, SpeakerModel, dict]:
-    """One-call measurement: linear IR, a calibrated speaker model, and the profile.
+) -> tuple[np.ndarray, dict]:
+    """One-call measurement: the linear IR and the harmonic distortion profile.
 
-    The returned :class:`SpeakerModel` reuses the measured linear response as its
-    first-order kernel and derives the higher orders from the measured harmonic
-    slope. Identifying each higher-order kernel's own frequency response exactly
-    requires the full Novak kernel inversion, which this does not attempt.
+    Harmonic *levels* are identified exactly; each higher-order kernel's own
+    frequency response would need the full Novak kernel inversion, which this does
+    not attempt.
     """
     orders = orders or [1, 2, 3, 4, 5]
     linear_ir, ir_info = extract_linear_ir(recorded, spec, ir_ms=ir_ms)
     profile = harmonic_profile(recorded, spec, orders, window=window)
     rolloff_db = calibrate_harmonic_rolloff(profile)
-
-    base = linear_ir[: min(len(linear_ir), 4096)]
-    base = base / (np.max(np.abs(base)) + EPS)
-    kernels = [base]
-    for order in orders[1:]:
-        gain = 10.0 ** (rolloff_db * (order - 1) / 20.0)
-        cutoff = min(spec.f2 / order, 0.98 * spec.sr / 2)
-        kernels.append(butter(base, spec.sr, cutoff, "low", 4) * gain)
-
-    model = SpeakerModel(
-        kernels=kernels, orders=list(orders), sr=spec.sr, label="measured", clip_kind="none"
-    )
-    info = {**ir_info, "harmonic_profile": profile, "harmonic_rolloff_db": round(rolloff_db, 2)}
-    return linear_ir, model, info
+    levels = np.asarray(profile["level_db"][1:], dtype=float)
+    thd = float(np.sqrt(np.sum(10.0 ** (levels / 10.0)))) if levels.size else 0.0
+    info = {
+        **ir_info,
+        "harmonic_profile": profile,
+        "harmonic_rolloff_db": round(rolloff_db, 2),
+        "thd_at_sweep_level": round(thd, 5),
+    }
+    return linear_ir, info

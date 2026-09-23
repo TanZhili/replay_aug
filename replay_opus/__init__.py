@@ -1,36 +1,36 @@
-"""Batch simulation of loudspeaker playback and microphone re-recording.
+"""Render TTS speech as live talkers and as loudspeaker playback in shared scenes.
 
-Turns clean or TTS-synthesised audio into audio that behaves like it was played in a
-room and captured again, by cascading the five stages a real replay goes through:
-playback device, room, environmental noise, capture device, transport.
+Training data for the rejection side of a full-duplex spoken dialogue system: the
+same TTS utterances rendered once as a person talking in a home or a car and once
+as a TV, phone, laptop, smart speaker or car audio system playing them back - in the
+same room, with the same noise and the same microphone, so that only the emission
+path separates the classes.
 
-    from replay_opus import Config, ReplayChain
+    from replay_opus import Config, UtteranceRenderer
 
-    chain = ReplayChain(Config())
-    result = chain.process(audio, sr, key="utt_0001", variant=0)
+    renderer = UtteranceRenderer(Config())
+    live, device = renderer.render(audio, sr, key="utt_0001", variant=0)
 """
 
-from .chain import ChainResult, ReplayChain, describe_config
+from .acoustics import Directivity, Room, absorption_for_rt60, room_impulse_response
+from .compose import ComposedScene, SceneComposer, frame_labels
 from .config import Config
-from .irbank import IRBank, reshape_ir, synth_ir
-from .measure import SweepSpec, generate_sweep, measure_chain
-from .metrics import describe_ir, estimate_c50, estimate_drr, estimate_t60
+from .render import RenderedClip, UtteranceRenderer
+from .scene import Scene, SceneRenderer
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
-    "ChainResult",
+    "ComposedScene",
     "Config",
-    "IRBank",
-    "ReplayChain",
-    "SweepSpec",
-    "describe_config",
-    "describe_ir",
-    "estimate_c50",
-    "estimate_drr",
-    "estimate_t60",
-    "generate_sweep",
-    "measure_chain",
-    "reshape_ir",
-    "synth_ir",
+    "Directivity",
+    "RenderedClip",
+    "Room",
+    "Scene",
+    "SceneComposer",
+    "SceneRenderer",
+    "UtteranceRenderer",
+    "absorption_for_rt60",
+    "frame_labels",
+    "room_impulse_response",
 ]

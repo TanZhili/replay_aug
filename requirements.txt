@@ -2,8 +2,7 @@ numpy>=1.26
 scipy>=1.11
 soundfile>=0.12
 PyYAML>=6.0
-av>=12.0            # bundles ffmpeg, so Opus/AAC/MP3/AMR need no system install
+av>=12.0            # bundles ffmpeg, so AAC/AC-3/MP2/Opus/MP3/AMR/G.711/G.722 need no system install
 
 # Optional
-pyroomacoustics>=0.7   # only for room.mode = "simulated"
-matplotlib>=3.8        # only for scripts/plot_manifest.py
+matplotlib>=3.8     # only for scripts/plot_manifest.py and scripts/plot_examples.py

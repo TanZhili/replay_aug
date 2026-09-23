@@ -7,7 +7,6 @@ and ACE Challenge corpora, so numbers here are comparable with their metadata.
 from __future__ import annotations
 
 import numpy as np
-from scipy import signal
 
 from .dsp import EPS
 
@@ -83,23 +82,3 @@ def describe_ir(h: np.ndarray, sr: int) -> dict:
         "c50_db": round(estimate_c50(h, sr), 2),
         "length_ms": round(1000.0 * len(h) / sr, 1),
     }
-
-
-def ltas(x: np.ndarray, sr: int, n_fft: int = 1024) -> tuple[np.ndarray, np.ndarray]:
-    """Long-term average spectrum in dB. Use it to compare simulated vs real batches."""
-    freqs, _, spec = signal.stft(x, fs=sr, nperseg=n_fft, noverlap=n_fft // 2)
-    mag = np.mean(np.abs(spec) ** 2, axis=1)
-    return freqs, 10.0 * np.log10(mag + EPS)
-
-
-def thd_ratio(x: np.ndarray, y: np.ndarray) -> float:
-    """Energy ratio of the residual after optimal linear scaling, in dB.
-
-    A crude but useful proxy for how much non-linear distortion a stage added.
-    """
-    n = min(len(x), len(y))
-    x, y = x[:n], y[:n]
-    denom = float(np.dot(x, x)) + EPS
-    gain = float(np.dot(x, y)) / denom
-    residual = y - gain * x
-    return float(10.0 * np.log10((np.sum(residual**2) + EPS) / (np.sum((gain * x) ** 2) + EPS)))

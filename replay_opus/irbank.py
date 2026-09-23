@@ -1,15 +1,14 @@
-"""Impulse response sourcing: measured files, parametric synthesis, room simulation.
+"""Measured impulse responses and parametric IR synthesis.
 
-Three ways to obtain the room stage, in descending order of fidelity:
-
-1. ``measured``  - convolve a real IR (ReplayDF, MIT IR Survey, SLR28, your own sweeps).
-2. ``synthetic`` - reshape a measured IR to a requested (T60, DRR) pair, which is how
-   Luong et al. (SLT 2024) grew 270 measured IRs into a set 500x larger.
-3. ``simulated`` - image-source method via pyroomacoustics when no measured IR exists.
+Used for three things: measured room IRs that stand in for the geometric room model
+(grouped by room so that the talker and the devices of one scene come from the same
+real room), measured microphone responses, and the small parametric rooms that
+content was originally recorded in.
 """
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -116,8 +115,7 @@ def reshape_ir(
     """Retarget a measured IR's T60 and DRR (Bryan, ICASSP 2020).
 
     T60 can only be *shortened*: lengthening would have to invent a reverberant tail
-    that was never recorded. Targets above the IR's own T60 are clamped, so build long
-    tails with :func:`synth_ir` instead.
+    that was never recorded. Targets above the IR's own T60 are clamped.
     """
     out = trim_noise_floor(np.asarray(h, dtype=np.float64), sr)
 
@@ -174,39 +172,16 @@ def synth_ir(
     return h / (norm + EPS)
 
 
-def simulate_room_ir(
-    sr: int,
-    room_dim: tuple[float, float, float],
-    src: tuple[float, float, float],
-    mic: tuple[float, float, float],
-    t60: float,
-    max_order: int | None = None,
-) -> np.ndarray:
-    """Image-source RIR via pyroomacoustics. Optional dependency.
+def scale_for_distance(h: np.ndarray, sr: int, distance_m: float) -> np.ndarray:
+    """Give a measured IR the direct-path amplitude of a source ``distance_m`` away.
 
-    ``max_order`` defaults to the order pyroomacoustics says is needed for the
-    requested T60; capping it below that truncates the tail and the realised T60
-    comes out short.
+    A measured IR's absolute gain means nothing across datasets. Pinning the direct
+    part to ``1/d`` keeps the IR's own direct-to-reverberant balance while putting the
+    source at a physically plausible level for where the scene placed it.
     """
-    try:
-        import pyroomacoustics as pra  # noqa: PLC0415 - optional dependency
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            "room_mode='simulated' needs pyroomacoustics (pip install pyroomacoustics)"
-        ) from exc
-
-    absorption, computed_order = pra.inverse_sabine(t60, room_dim)
-    order = computed_order if max_order is None else min(max_order, computed_order)
-    room = pra.ShoeBox(
-        room_dim,
-        fs=sr,
-        materials=pra.Material(absorption),
-        max_order=order,
-    )
-    room.add_source(list(src))
-    room.add_microphone(list(mic))
-    room.compute_rir()
-    return prepare_ir(np.asarray(room.rir[0][0], dtype=np.float64), sr)
+    direct, _, _, _ = split_direct_late(h, sr)
+    e_direct = float(np.sum(direct**2))
+    return h / (np.sqrt(e_direct) + EPS) / max(distance_m, 0.05)
 
 
 @dataclass
@@ -250,20 +225,19 @@ class IRBank:
         if not self.paths:
             raise RuntimeError("IR bank is empty")
         index = int(rng.integers(len(self.paths)))
-        return self.get(self.paths[index]), self._label(index)
+        return self.get(self.paths[index]), self.labels[index]
 
-    def _label(self, index: int) -> str:
-        if self.labels:
-            return self.labels[index]
-        path = self.paths[index]
-        if self.root is not None:
-            return path.relative_to(self.root).as_posix()
-        return path.name
+    def rooms(self) -> dict[str, list[int]]:
+        """Indices grouped by parent directory: one directory per measured room."""
+        groups: dict[str, list[int]] = defaultdict(list)
+        for index, label in enumerate(self.labels):
+            groups[str(Path(label).parent.as_posix())].append(index)
+        return dict(groups)
 
     def stats(self) -> list[dict]:
         rows = []
         for index, path in enumerate(self.paths):
-            label = self._label(index)
+            label = self.labels[index]
             try:
                 h = self.get(path)
             except Exception as exc:  # noqa: BLE001 - report and continue
@@ -291,16 +265,14 @@ def filter_ir_stats(rows: list[dict], t60_max: float = 2.0, drr_range=(-10.0, 30
 __all__ = [
     "IRBank",
     "amplitude_decay_rate",
-    "describe_ir",
     "estimate_drr",
-    "estimate_t60",
     "filter_ir_stats",
     "load_ir",
     "prepare_ir",
     "reshape_ir",
     "retarget_t60",
+    "scale_for_distance",
     "set_drr",
-    "simulate_room_ir",
     "synth_ir",
     "trim_noise_floor",
 ]
