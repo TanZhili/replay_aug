@@ -1,7 +1,7 @@
 [project]
 name = "replay-opus"
-version = "0.2.0"
-description = "Render TTS speech as live talkers and as device playback in shared scenes, for full-duplex rejection training"
+version = "0.3.0"
+description = "Render TTS or recorded speech as live talkers and as device playback (single, rerecorded, same-room replay) in shared scenes, for full-duplex rejection training"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",

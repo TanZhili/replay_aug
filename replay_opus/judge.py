@@ -3,23 +3,24 @@
 For every pair in a ``render`` output this rebuilds the scene and scores four
 conditions with each detector:
 
-``dry``     the input TTS, no room at all
-``live``    the rendered live-talker file
-``device``  the rendered device-playback file
-``replay``  positive control, rebuilt here: the live recording itself, replayed through
-            the same device at the same spot in the same scene - the ASVspoof definition
-            of a replay attack (two acoustic passes)
+``dry``      the input TTS, no room at all
+``live``     the rendered live-talker file
+``device``   the rendered device-playback file
+``control``  positive control, rebuilt here: the live recording itself, replayed through
+             the same device at the same spot in the same scene - the ASVspoof definition
+             of a replay attack (two acoustic passes). It does not go through the
+             playback-form code, so it stays a fixed yardstick for the ``replay`` form too.
 
 One score on its own says little: the public checkpoints were trained on ASVspoof
 physical-access data, where the bona fide class is a single loudspeaker pass and the
 spoof class a recorded-then-replayed second pass. The comparisons carry the meaning:
 
-* ``replay`` vs ``live`` - can the detector see a replay in our scenes at all? Near 0.5
+* ``control`` vs ``live`` - can the detector see a replay in our scenes at all? Near 0.5
   means no, and then its view of the device class is uninformative.
 * ``live`` vs ``dry`` - does it simply react to room and noise? If so, only same-scene
   comparisons mean anything.
 * ``device`` vs ``live`` - how much replay evidence it finds in our device renderings,
-  within the same scene; set it against the ``replay`` row. It is also broken down by
+  within the same scene; set it against the ``control`` row. It is also broken down by
   playback form: forms with a recording stage in front of the loudspeaker should read
   as more replayed than a single pass.
 
@@ -46,7 +47,7 @@ from .pathlist import read_utterances
 from .render import UtteranceRenderer
 from .scene import derive_seed
 
-CONDITIONS = ("dry", "live", "device", "replay")
+CONDITIONS = ("dry", "live", "device", "control")
 SPOOF_LABELS = {"spoof", "replay", "device", "fake", "1"}
 BONAFIDE_LABELS = {"bonafide", "bona_fide", "genuine", "live", "real", "0"}
 
@@ -113,10 +114,10 @@ def _summary(scores: dict[str, dict[str, float]], meta: dict[str, dict]) -> dict
     for condition, values in by_condition.items():
         if len(values):
             out["median"][condition] = round(float(np.median(values)), 3)
-    for high, low in (("device", "live"), ("replay", "live"), ("live", "dry"), ("device", "dry")):
+    for high, low in (("device", "live"), ("control", "live"), ("live", "dry"), ("device", "dry")):
         if len(by_condition[high]) and len(by_condition[low]):
             out["auc"][f"{high}>{low}"] = round(auc(by_condition[high], by_condition[low]), 3)
-    for high in ("device", "replay"):
+    for high in ("device", "control"):
         diffs = np.array(
             [s[high] - s["live"] for s in scores.values() if high in s and "live" in s]
         )
@@ -212,7 +213,7 @@ def run_judge(
         if controls:
             audio, sr = sf.read(any_record["input"], always_2d=False)
             clips[pair]["dry"] = prepare(to_mono(audio), sr, level_dbfs)
-            clips[pair]["replay"] = prepare(*_replay_control(renderer, any_record), level_dbfs)
+            clips[pair]["control"] = prepare(*_replay_control(renderer, any_record), level_dbfs)
         if progress:
             progress("prepare", done, len(pairs))
 
@@ -265,11 +266,13 @@ def format_judge_report(result: dict) -> str:
     lines += [
         "",
         "How to read this:",
-        "  replay>live near 1.0 : the detector sees an ASVspoof-style replay in these scenes;",
-        "                         near 0.5 it cannot, and its verdict on 'device' says nothing.",
+        "  control>live near 1.0 : the detector sees an ASVspoof-style replay in these scenes;",
+        "                          near 0.5 it cannot, and its verdict on 'device' says nothing.",
         "  live>dry well above 0.5 : it reacts to room and noise alone, so only same-scene",
         "                            comparisons count.",
-        "  device>live : replay evidence in the device renderings; compare with replay>live.",
+        "  device>live : replay evidence in the device renderings; compare with control>live.",
+        "  by playback form : forms with a recording stage (rerecorded, replay) should read as",
+        "                     more replayed than single; the control is not one of the forms.",
         "  These checkpoints learned the second recording pass of ASVspoof replays, not mouth vs",
         "  loudspeaker; a real reference set (--reference) is what shows whether one transfers.",
     ]

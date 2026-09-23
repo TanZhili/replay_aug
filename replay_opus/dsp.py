@@ -232,9 +232,7 @@ def speech_level_from_energy(
     return level
 
 
-def speech_level_db(
-    x: np.ndarray, sr: int, weighted: bool = True, frame_ms: float = 20.0
-) -> float:
+def speech_level_db(x: np.ndarray, sr: int, weighted: bool = True, frame_ms: float = 20.0) -> float:
     """Active speech level of a signal, A-weighted by default (see
     :func:`speech_level_from_energy`)."""
     y = a_weight(x, sr) if weighted else np.asarray(x, dtype=np.float64)

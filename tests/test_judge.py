@@ -106,7 +106,7 @@ def test_judge_reports_paired_statistics(rendered, monkeypatch):
     entry = result["detectors"]["high-band"]
     assert result["n_pairs"] == 3
     assert set(entry["median"]) == set(judge.CONDITIONS)
-    assert {"device>live", "replay>live", "live>dry", "device>dry"} == set(entry["auc"])
+    assert {"device>live", "control>live", "live>dry", "device>dry"} == set(entry["auc"])
     paired = entry["paired"]["device>live"]
     assert paired["n"] == 3 and 0.0 <= paired["win_rate"] <= 1.0
     assert sum(v["n"] for v in entry["by_playback_form"].values()) == 3
@@ -144,9 +144,9 @@ def test_judge_command_writes_scores(rendered, monkeypatch, tmp_path, capsys):
         ]
     )
     assert code == 0
-    assert "replay>live" in capsys.readouterr().out
+    assert "control>live" in capsys.readouterr().out
     saved = json.loads(out.read_text(encoding="utf-8"))
-    assert saved["detectors"]["high-band"]["paired"]["replay>live"]["n"] == 3
+    assert saved["detectors"]["high-band"]["paired"]["control>live"]["n"] == 3
 
 
 def test_judge_without_a_saved_config_needs_one(rendered):

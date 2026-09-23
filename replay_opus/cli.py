@@ -469,7 +469,7 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one flat list 
     )
     judge.add_argument("--limit", type=int, help="judge only the first N pairs")
     judge.add_argument(
-        "--no-controls", action="store_true", help="skip the dry and replay controls"
+        "--no-controls", action="store_true", help="skip the dry and replay-control conditions"
     )
     judge.add_argument("--reference", help="your own recordings: path<TAB>bonafide|spoof per line")
     judge.add_argument("--config", help="config used to render; default <render dir>/config.yaml")
